@@ -10,31 +10,38 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options={"timeou
 
 MODEL = "gemini-3.1-flash-lite"
 
-with open("invoices/invoice1.pdf", "rb") as f:
-    pdf_bytes = f.read()
-
-pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-prompt = (
+PROMPT = (
     "Read this invoice. Return JSON with these keys: "
     "invoice_number, vendor, date, po_number, "
-    "items (a list of objects with name, quantity, unit_price), total."
+    "items (a list of objects with name, quantity, unit_price, line_total), total."
 )
 
-response = None
-for attempt in range(1, 6):
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[pdf_part, prompt],
-            config={"response_mime_type": "application/json"},
-        )
-        break
-    except Exception as e:
-        print("Attempt", attempt, "failed:", str(e)[:120])
-        time.sleep(10)
 
-if response is None:
-    print("Gemini is too busy right now. Try again later.")
-else:
-    data = json.loads(response.text)
-    print(json.dumps(data, indent=2))
+def extract_invoice(pdf_path):
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+    for attempt in range(1, 6):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=[pdf_part, PROMPT],
+                config={"response_mime_type": "application/json"},
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            print("Attempt", attempt, "failed:", str(e)[:120])
+            time.sleep(10)
+    return None
+
+
+if __name__ == "__main__":
+    for name in sorted(os.listdir("invoices")):
+        if name.endswith(".pdf"):
+            print("=== " + name + " ===")
+            result = extract_invoice("invoices/" + name)
+            if result is None:
+                print("Could not read this invoice.")
+            else:
+                print(json.dumps(result, indent=2))
