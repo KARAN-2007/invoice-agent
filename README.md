@@ -1,3 +1,6 @@
 # invoice-agent
 Buildathon project
-#test.py- tried with gemini 3.8 but server was full, tried 2.5 flash, it worked
+#test.py- tried , worked
+#json_extraction - same api issue , worked
+#invoice_extraction - no issue, it can read pdf
+
