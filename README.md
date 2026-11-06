@@ -13,3 +13,6 @@ Core Pipeline Components backend We Built
 
 #invoice_extraction.py- fixed it so it now works for all type of files , tested on all fake data: data was correct
 #tools.py- added tool that now checks PO number , catches and fixes typos
+#temp_sample_data.py- sample data of type of PO
+#run_invoive.py- calls the tool to check PO number on all the files
+
