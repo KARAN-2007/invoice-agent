@@ -10,3 +10,5 @@ Core Pipeline Components backend We Built
 3. **`matcher.py`:** Deterministic 3-way matching engine evaluating PO vs. GRN vs. Invoice tolerances and flagging discrepancies.
 4. **`audit_report.py`:** Queries PostgreSQL to generate structured compliance audit logs and discrepancy summaries.
 5. **`ingest_api.py`:** API ingestion bridge accepting incoming JSON invoice payloads and triggering real-time matching.
+
+#invoice_extraction - fixed it so it now works for all type of files , tested on all fake data: data was correct
