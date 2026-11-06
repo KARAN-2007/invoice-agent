@@ -11,7 +11,7 @@ def find_po(po_number):
         return {"status": "found", "po": po, "note": "exact match"}
 
     # 2. Close matches (typo recovery)
-    close = difflib.get_close_matches(po_number, numbers, n=3, cutoff=0.4)
+    close = difflib.get_close_matches(po_number, numbers, n=3, cutoff=0.75)
     if len(close) == 1:
         po = PURCHASE_ORDERS[numbers.index(close[0])]
         return {
