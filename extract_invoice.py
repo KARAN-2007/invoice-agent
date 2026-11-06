@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import mimetypes
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -13,20 +14,33 @@ MODEL = "gemini-3.1-flash-lite"
 PROMPT = (
     "Read this invoice. Return JSON with these keys: "
     "invoice_number, vendor, date, po_number, "
-    "items (a list of objects with name, quantity, unit_price, line_total), total."
+    "items (a list of objects with name, quantity, unit_price, line_total), tax, total."
 )
 
+SUPPORTED_TYPES = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
-def extract_invoice(pdf_path):
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
-    pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+def extract_invoice(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    mime_type = SUPPORTED_TYPES.get(ext)
+    if mime_type is None:
+        raise ValueError("Unsupported file type: " + ext)
+
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+    file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
     for attempt in range(1, 6):
         try:
             response = client.models.generate_content(
                 model=MODEL,
-                contents=[pdf_part, PROMPT],
+                contents=[file_part, PROMPT],
                 config={"response_mime_type": "application/json"},
             )
             return json.loads(response.text)
@@ -38,7 +52,7 @@ def extract_invoice(pdf_path):
 
 if __name__ == "__main__":
     for name in sorted(os.listdir("invoices")):
-        if name.endswith(".pdf"):
+        if os.path.splitext(name)[1].lower() in SUPPORTED_TYPES:
             print("=== " + name + " ===")
             result = extract_invoice("invoices/" + name)
             if result is None:
