@@ -15,4 +15,4 @@ Core Pipeline Components backend We Built
 #tools.py- added tool that now checks PO number , catches and fixes typos
 #temp_sample_data.py- sample data of type of PO
 #run_invoive.py- calls the tool to check PO number on all the files
-
+#checks.py- checks the total math is correct
