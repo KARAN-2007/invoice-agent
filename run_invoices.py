@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from checks import check_line_math, check_vendor
 from extract_invoice import extract_invoice, SUPPORTED_TYPES
 from tools import find_po
 
@@ -34,6 +35,14 @@ def main():
         if isinstance(data, list):
             data = data[0] if data else {}
 
+        # Checks that only need the invoice itself
+        issues = check_line_math(data)
+        if issues:
+            for issue in issues:
+                print("  ! " + issue["type"] + ": " + issue["detail"])
+        else:
+            print("  math: OK")
+
         po_number = str(data.get("po_number") or "").strip().upper()
         if not po_number:
             print("  no PO number on invoice -> manual review")
@@ -43,8 +52,8 @@ def main():
         print("  extracted PO: " + po_number)
         print("  status: " + result["status"] + " | " + result["note"])
         if result["po"]:
-            print("  vendor on PO: " + result["po"]["vendor"])
-            print("  vendor on invoice: " + str(data.get("vendor")))
+            vendor_check = check_vendor(data.get("vendor"), result["po"]["vendor"])
+            print("  vendor: " + vendor_check["status"] + " | " + vendor_check["note"])
 
 
 if __name__ == "__main__":
