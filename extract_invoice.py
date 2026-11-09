@@ -9,12 +9,14 @@ from google.genai import types
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options={"timeout": 30000})
 
-MODEL = "gemini-3.1-flash-lite"
+MODEL = os.getenv("MODEL", "gemini-3.1-flash-lite")
 
 PROMPT = (
     "Read this invoice. Return JSON with these keys: "
     "invoice_number, vendor, date, po_number, "
-    "items (a list of objects with name, quantity, unit_price, line_total), tax, total."
+        "items (a list of objects with name, quantity, unit_price, line_total), "
+    "subtotal, tax, shipping, discount, total. "
+    "Use null for subtotal, tax, shipping or discount if the invoice does not show it."
 )
 
 SUPPORTED_TYPES = {
