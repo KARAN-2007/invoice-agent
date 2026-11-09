@@ -23,6 +23,9 @@
       "line_total": 15.0
     }
   ],
+  "subtotal": 145.0,
   "tax": 9.06,
+  "shipping": null,
+  "discount": null,
   "total": 154.06
 }
