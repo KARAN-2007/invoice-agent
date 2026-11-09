@@ -12,9 +12,12 @@ from agent_tools import (
     log_step,
     lookup_po,
     read_invoice,
+    review_reason,
     send_to_human_review,
     start_run,
+    verify_invoice,
 )
+from db_store import save_approval_request
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options={"timeout": 45000})
@@ -44,6 +47,20 @@ Rules:
 - Finish with a short summary and one recommendation line: READY_FOR_APPROVAL if every check passed, otherwise NEEDS_HUMAN_REVIEW."""
 
 
+def record_outcome(file_name, summary):
+    """Decide the final recommendation in plain code and save it for a human to approve or reject.
+    The AI's own recommendation is never trusted alone: the checks are repeated without the AI."""
+    problems = verify_invoice(file_name)
+    reason = review_reason(file_name)
+    if problems and not reason:
+        reason = "Safety check found: " + " | ".join(problems)
+        log_step("agent:safety_override", {"file": file_name, "problems": problems})
+    recommendation = "NEEDS_HUMAN_REVIEW" if reason else "READY_FOR_APPROVAL"
+    request_id = save_approval_request(file_name, recommendation, summary, reason)
+    log_step("agent:recorded", {"file": file_name, "recommendation": recommendation, "approval_request_id": request_id})
+    return {"summary": summary, "recommendation": recommendation, "approval_request_id": request_id}
+
+
 def run_agent(file_name):
     start_run()
     log_step("agent:start", {"file": file_name, "models": MODELS})
@@ -60,7 +77,7 @@ def run_agent(file_name):
             chat = client.chats.create(model=model, config=config)
             response = chat.send_message("Check the invoice file " + file_name + ".")
             log_step("agent:finish", {"model": model, "summary": response.text})
-            return response.text
+            return record_outcome(file_name, response.text)
         except Exception as e:
             log_step("agent:error", {"attempt": attempt, "model": model, "error": str(e)[:150]})
             if attempt < MAX_ATTEMPTS:
@@ -71,11 +88,17 @@ def run_agent(file_name):
     # Fail safe: if the agent cannot run, the invoice must not be silently dropped
     log_step("agent:gave_up", {"file": file_name})
     send_to_human_review(file_name, "The automated check could not finish because the AI service was unavailable. Please check this invoice manually.")
-    return None
+    return record_outcome(file_name, "The automated check could not finish. The invoice was sent to human review.")
 
 
 if __name__ == "__main__":
     name = sys.argv[1] if len(sys.argv) > 1 else "invoice3.pdf"
     print("=== Agent checking " + name + " ===")
-    summary = run_agent(name)
-    print("\n" + (summary or "The agent could not finish. The invoice was sent to human review."))
+    result = run_agent(name)
+    print("\n" + (result["summary"] or "The automated check could not finish."))
+    print("\nRecommendation: " + result["recommendation"])
+    if result["approval_request_id"] is not None:
+        print("Saved as approval request #" + str(result["approval_request_id"]) + ". A human must approve or reject it.")
+    else:
+        print("Could not save the approval request (database unavailable).")
+        
