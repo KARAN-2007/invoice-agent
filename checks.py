@@ -15,7 +15,8 @@ def to_number(value):
 
 
 def check_line_math(invoice):
-    """Check quantity x unit price = line total for each item, and that the lines add up to the invoice total.
+    """Check quantity x unit price = line total for each item, and that the lines plus tax and shipping,
+    minus any discount, add up to the invoice total.
     Returns a list of issues. An empty list means the math is fine."""
     issues = []
     line_sum = 0.0
@@ -40,11 +41,18 @@ def check_line_math(invoice):
     total = to_number(invoice.get("total"))
     if total is None:
         issues.append({"type": "MISSING_VALUE", "detail": "Invoice total is missing."})
-    elif abs(line_sum - total) > 0.01:
-        diff = round(total - line_sum, 2)
+        return issues
+
+    tax = to_number(invoice.get("tax")) or 0.0
+    shipping = to_number(invoice.get("shipping")) or 0.0
+    discount = to_number(invoice.get("discount")) or 0.0
+    expected_total = round(line_sum + tax + shipping - discount, 2)
+
+    if abs(expected_total - total) > 0.01:
+        diff = round(total - expected_total, 2)
         issues.append({"type": "TOTAL_MISMATCH",
-                       "detail": f"Items add up to {line_sum:g} but the invoice total is {total:g} (difference {diff:g}). "
-                                 "This can be tax or shipping, so a human should confirm."})
+                       "detail": f"Items {line_sum:g} + tax {tax:g} + shipping {shipping:g} - discount {discount:g} = "
+                                 f"{expected_total:g}, but the invoice total is {total:g} (difference {diff:g})."})
     return issues
 
 
