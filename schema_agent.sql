@@ -22,3 +22,14 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     decided_at TIMESTAMP,
     decision_note TEXT
 );
+
+
+-- People who can log in to the app. Passwords are stored as salted hashes, never as plain text.
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    full_name VARCHAR(100),
+    role VARCHAR(20) NOT NULL CHECK (role IN ('vendor', 'approver', 'admin')),
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
