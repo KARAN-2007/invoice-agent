@@ -33,4 +33,18 @@ def log_since(last_id):
         return [{"id": r[0], "time": r[1], "step": r[2], "detail": r[3]} for r in rows]
     except Exception:
         return []
-    
+
+
+def recent_log(limit=100):
+    """The newest rows of the audit log, newest first. Raises an error if the database cannot be reached."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, logged_at, step, detail FROM agent_log ORDER BY id DESC LIMIT %s;",
+                (limit,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [{"id": r[0], "time": r[1], "step": r[2], "detail": r[3]} for r in rows]
