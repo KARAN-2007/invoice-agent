@@ -41,7 +41,11 @@ def _load_invoice(file_name):
     path = INVOICE_DIR / file_name
     if not path.exists():
         return None
-    data = get_invoice_data(path)
+    try:
+        data = get_invoice_data(path)
+    except Exception as e:
+        log_step("tool:load_invoice:error", {"file": file_name, "error": str(e)[:150]})
+        return None
     if isinstance(data, list):
         data = data[0] if data else None
     return data
