@@ -13,6 +13,7 @@ from db_reports import latest_log_id, log_since, recent_log
 from db_store import decide_request, list_approval_requests, save_log
 from extract_invoice import SUPPORTED_TYPES
 from theme import inject_theme, LOGIN_HERO_HTML, LOGIN_FOOTER_HTML
+from reason_labels import render_reasons, short_reasons
  
  
 INVOICE_DIR = Path(__file__).parent / "invoices"
@@ -673,58 +674,61 @@ def create_audit_csv(rows):
  
 def login_screen():
     left, right = st.columns([1.2, 0.85], gap="large")
- 
+
     with left:
         st.html(LOGIN_HERO_HTML)
- 
+
     with right:
         st.markdown(
             "<div class='login-label'>Account access</div>",
             unsafe_allow_html=True
         )
- 
+
         st.markdown("## Welcome back")
         st.caption("Sign in to access your invoice workspace.")
- 
+
         with st.form("login_form"):
             username = st.text_input(
                 "Username",
                 placeholder="Enter your username"
             )
- 
+
             password = st.text_input(
                 "Password",
                 type="password",
                 placeholder="Enter your password"
             )
- 
+
             submitted = st.form_submit_button(
                 "Sign in →",
                 type="primary",
                 use_container_width=True
             )
- 
+
+        # The result is shown right under the form, so it is always visible
+        if submitted:
+            try:
+                user = authenticate(username, password)
+
+            except Exception as e:
+                st.error(
+                    "Could not reach the database. Check that PostgreSQL is running and that .env is correct."
+                )
+                st.caption(str(e)[:200])
+                return
+
+            if user:
+                st.session_state["user"] = user
+                st.rerun()
+            else:
+                st.error(
+                    "Wrong username or password. Passwords are case-sensitive, so check Caps Lock."
+                )
+
         st.html(LOGIN_FOOTER_HTML)
-        st.caption("Demo accounts are listed in the README.")
- 
-    if submitted:
-        try:
-            user = authenticate(username, password)
- 
-        except Exception as e:
-            st.error(
-                "Could not reach the database. Check that PostgreSQL is running and that .env is correct."
-            )
-            st.caption(str(e)[:200])
-            return
- 
-        if user:
-            st.session_state["user"] = user
-            st.rerun()
-        else:
-            st.error("Wrong username or password.")
- 
- 
+        st.caption("Demo accounts are listed in the README. Passwords are case-sensitive.")
+
+
 # ---------- VENDOR UPLOAD PAGE ----------
  
 def upload_page(user):
@@ -957,13 +961,7 @@ def approvals_page(user):
                     st.markdown("**AI assessment**")
  
                     if needs_review:
-                        st.warning(
-                            "The agent flagged this invoice: "
-                            + str(
-                                req["review_reason"]
-                                or "No specific reason was provided."
-                            )
-                        )
+                        render_reasons(req["review_reason"])
                     else:
                         st.success(
                             "The agent found no problems in its checks."
@@ -1043,6 +1041,7 @@ def approvals_page(user):
                     "Request": row["id"],
                     "Invoice": row["file_name"],
                     "AI recommendation": row["recommendation"],
+                    "Flagged for": short_reasons(row["review_reason"]),
                     "Human decision": row["status"],
                     "Decided by": row["decided_by"],
                     "Decision time": row["decided_at"],
