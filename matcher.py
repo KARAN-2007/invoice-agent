@@ -1,89 +1,95 @@
-import os
-import psycopg2
-from dotenv import load_dotenv
+import json
+from pathlib import Path
 
-# Load environment variables from .env
-load_dotenv()
+# Point to your folders
+PO_DIR = Path("data/purchase_orders")
+GRN_DIR = Path("data/goods_receipts")
+INV_DIR = Path("data/invoices")
+AUDIT_DIR = Path("data/audit_reports") # Folder where audit JSONs will be saved
 
-DB_NAME = os.getenv("DB_NAME", "invoice_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
+def process_orders_sequentially():
+    print("📂 Starting live order-by-order processing from folders...\n")
 
-def run_three_way_matching():
-    try:
-        connection = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT
-        )
-        cursor = connection.cursor()
-        print("Connected to PostgreSQL. Running 3-Way Matching Engine...\n")
+    if not INV_DIR.exists():
+        print("⚠️ Invoices folder does not exist!")
+        return
+        
+    # Ensure audit directory exists so it doesn't crash
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Fetch all pending invoices along with their associated PO total and GRN status
-        query = """
-            SELECT 
-                i.id AS invoice_id,
-                i.vendor_id,
-                i.po_id,
-                i.total_amount AS invoice_amount,
-                po.total_amount AS po_amount,
-                g.status AS grn_status
-            FROM invoices i
-            JOIN purchase_orders po ON i.po_id = po.id
-            LEFT JOIN goods_receipts g ON i.po_id = g.po_id
-            WHERE i.status = 'PENDING';
-        """
-        cursor.execute(query)
-        pending_invoices = cursor.fetchall()
+    seen_invoices = set()
 
-        matched_count = 0
-        flagged_count = 0
+    # 1. Read invoices ONE BY ONE
+    for inv_file in INV_DIR.glob("*.json"):
+        with open(inv_file, "r", encoding="utf-8") as f:
+            invoice_data = json.load(f)
 
-        for inv in pending_invoices:
-            invoice_id, vendor_id, po_id, invoice_amount, po_amount, grn_status = inv
-            discrepancies = []
+        vendor_id = invoice_data.get("vendor_id")
+        po_id = invoice_data.get("po_id")
+        invoice_number = invoice_data.get("invoice_number")
+        invoice_amount = float(invoice_data.get("total_amount", 0))
 
-            # Rule 1: Check if Goods Receipt exists and is RECEIVED
-            if not grn_status or grn_status != 'RECEIVED':
-                discrepancies.append(("MISSING_GRN", f"Goods Receipt not found or not received for PO #{po_id}"))
+        print(f"📄 Processing Order: Invoice #{invoice_number} (PO #{po_id})")
 
-            # Rule 2: Check for Price / Amount Mismatch (Tolerance threshold: exact match or minor variance)
-            if float(invoice_amount) > float(po_amount):
-                diff = float(invoice_amount) - float(po_amount)
-                discrepancies.append(("PRICE_HIKE", f"Invoice amount ({invoice_amount}) exceeds PO amount ({po_amount}) by {diff}"))
+        discrepancies = []
 
-            if discrepancies:
-                flagged_count += 1
-                print(f"⚠️ [FLAGGED] Invoice #{invoice_id} (PO #{po_id}) has issues:")
-                for disc_type, details in discrepancies:
-                    print(f"   - {disc_type}: {details}")
-                    # Insert into audit_logs table
-                    cursor.execute("""
-                        INSERT INTO audit_logs (invoice_id, discrepancy_type, details)
-                        VALUES (%s, %s, %s);
-                    """, (invoice_id, disc_type, details))
-            else:
-                matched_count += 1
-                print(f"✅ [MATCHED] Invoice #{invoice_id} matches PO #{po_id} perfectly.")
-                # Update invoice status to APPROVED or PAID
-                cursor.execute("""
-                    UPDATE invoices SET status = 'APPROVED' WHERE id = %s;
-                """, (invoice_id,))
+        # 2. Check for Duplicate Invoice
+        inv_key = (vendor_id, invoice_number)
+        if inv_key in seen_invoices:
+            discrepancies.append(("DUPLICATE_INVOICE", f"Invoice '{invoice_number}' was already submitted."))
+        else:
+            seen_invoices.add(inv_key)
 
-        connection.commit()
-        print(f"\n🎯 Matching Complete: {matched_count} approved, {flagged_count} flagged discrepancies logged to audit_logs.")
+        # 3. Fetch matching PO file on-demand
+        po_data = None
+        po_file = PO_DIR / f"po_{po_id}.json"
+        if po_file.exists():
+            with open(po_file, "r", encoding="utf-8") as pf:
+                po_data = json.load(pf)
+        else:
+            discrepancies.append(("MISSING_PO", f"Purchase Order file for PO #{po_id} is missing."))
 
-    except Exception as e:
-        print(f"Error running matching engine: {e}")
-        if 'connection' in locals():
-            connection.rollback()
-    finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'connection' in locals(): connection.close()
+        # 4. Fetch matching GRN file on-demand
+        grn_data = None
+        grn_file = GRN_DIR / f"grn_{po_id}.json"
+        if grn_file.exists():
+            with open(grn_file, "r", encoding="utf-8") as gf:
+                grn_data = json.load(gf)
+        else:
+            discrepancies.append(("MISSING_GRN", f"Goods Receipt file for PO #{po_id} is missing."))
+
+        # 5. Run Price Variance Check (if PO is available)
+        if po_data:
+            po_amount = float(po_data.get("total_amount", 0))
+            if invoice_amount > po_amount:
+                diff = invoice_amount - po_amount
+                discrepancies.append(("PRICE_HIKE", f"Invoice amount ({invoice_amount}) exceeds PO amount ({po_amount}) by {diff}."))
+
+        # 6. Run GRN Status Check (if GRN is available)
+        if grn_data:
+            grn_status = grn_data.get("status")
+            if grn_status != "RECEIVED":
+                discrepancies.append(("GRN_NOT_RECEIVED", f"Goods Receipt status is '{grn_status}', not RECEIVED."))
+
+        # 7. Save Audit Report to Disk for THIS ONE ORDER
+        save_audit_report(invoice_number, discrepancies)
+        print("-" * 50)
+
+def save_audit_report(invoice_number, discrepancies):
+    """Saves the individual order's audit report into a JSON file on disk."""
+    audit_file = AUDIT_DIR / f"audit_{invoice_number}.json"
+    
+    status = "FLAGGED" if discrepancies else "APPROVED"
+    report_data = {
+        "invoice_number": invoice_number,
+        "status": status,
+        "discrepancies": [{"type": d[0], "details": d[1]} for d in discrepancies]
+    }
+
+    with open(audit_file, "w", encoding="utf-8") as f:
+        json.dump(report_data, f, indent=4)
+
+    print(f"📋 Audit saved to disk: {audit_file} [{status}]")
 
 if __name__ == "__main__":
-    run_three_way_matching()
+    process_orders_sequentially()
