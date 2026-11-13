@@ -5,21 +5,18 @@ from pathlib import Path
 PO_DIR = Path("data/purchase_orders")
 GRN_DIR = Path("data/goods_receipts")
 INV_DIR = Path("data/invoices")
-AUDIT_DIR = Path("data/audit_reports") # Folder where audit JSONs will be saved
+AUDIT_DIR = Path("data/audit_reports")
 
 def process_orders_sequentially():
-    print("📂 Starting live order-by-order processing from folders...\n")
+    print("📂 Starting live order-by-order processing with item-level matching...\n")
 
     if not INV_DIR.exists():
         print("⚠️ Invoices folder does not exist!")
         return
         
-    # Ensure audit directory exists so it doesn't crash
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-
     seen_invoices = set()
 
-    # 1. Read invoices ONE BY ONE
     for inv_file in INV_DIR.glob("*.json"):
         with open(inv_file, "r", encoding="utf-8") as f:
             invoice_data = json.load(f)
@@ -27,20 +24,20 @@ def process_orders_sequentially():
         vendor_id = invoice_data.get("vendor_id")
         po_id = invoice_data.get("po_id")
         invoice_number = invoice_data.get("invoice_number")
-        invoice_amount = float(invoice_data.get("total_amount", 0))
+        invoice_items = invoice_data.get("items", [])
 
         print(f"📄 Processing Order: Invoice #{invoice_number} (PO #{po_id})")
 
         discrepancies = []
 
-        # 2. Check for Duplicate Invoice
+        # 1. Duplicate Invoice Check
         inv_key = (vendor_id, invoice_number)
         if inv_key in seen_invoices:
             discrepancies.append(("DUPLICATE_INVOICE", f"Invoice '{invoice_number}' was already submitted."))
         else:
             seen_invoices.add(inv_key)
 
-        # 3. Fetch matching PO file on-demand
+        # 2. Fetch matching PO file on-demand
         po_data = None
         po_file = PO_DIR / f"po_{po_id}.json"
         if po_file.exists():
@@ -49,7 +46,7 @@ def process_orders_sequentially():
         else:
             discrepancies.append(("MISSING_PO", f"Purchase Order file for PO #{po_id} is missing."))
 
-        # 4. Fetch matching GRN file on-demand
+        # 3. Fetch matching GRN file on-demand
         grn_data = None
         grn_file = GRN_DIR / f"grn_{po_id}.json"
         if grn_file.exists():
@@ -58,27 +55,51 @@ def process_orders_sequentially():
         else:
             discrepancies.append(("MISSING_GRN", f"Goods Receipt file for PO #{po_id} is missing."))
 
-        # 5. Run Price Variance Check (if PO is available)
+        # 4. Header-level & Item-level Matching (if PO exists)
         if po_data:
-            po_amount = float(po_data.get("total_amount", 0))
-            if invoice_amount > po_amount:
-                diff = invoice_amount - po_amount
-                discrepancies.append(("PRICE_HIKE", f"Invoice amount ({invoice_amount}) exceeds PO amount ({po_amount}) by {diff}."))
+            po_total = float(po_data.get("total_amount", 0))
+            inv_total = float(invoice_data.get("total_amount", 0))
 
-        # 6. Run GRN Status Check (if GRN is available)
+            # Total amount variance check
+            if inv_total > po_total:
+                discrepancies.append(("PRICE_HIKE", f"Invoice total ({inv_total}) exceeds PO total ({po_total})."))
+
+            # Build a lookup dictionary for PO items (SKU -> item details)
+            po_items_map = {item["sku"]: item for item in po_data.get("items", [])}
+
+            # 5. Item-by-Item Line Matching
+            for inv_item in invoice_items:
+                sku = inv_item.get("sku")
+                inv_qty = inv_item.get("quantity", 0)
+                inv_price = inv_item.get("unit_price", 0)
+
+                if sku not in po_items_map:
+                    discrepancies.append(("UNKNOWN_SKU", f"Item SKU '{sku}' on invoice was not found on PO #{po_id}."))
+                else:
+                    po_item = po_items_map[sku]
+                    po_qty = po_item.get("quantity", 0)
+                    po_price = po_item.get("unit_price", 0)
+
+                    # Check for quantity over-invoicing
+                    if inv_qty > po_qty:
+                        discrepancies.append(("QUANTITY_MISMATCH", f"Invoiced qty ({inv_qty}) for '{sku}' exceeds PO qty ({po_qty})."))
+
+                    # Check for unit price hikes
+                    if inv_price > po_price:
+                        discrepancies.append(("UNIT_PRICE_HIKE", f"Invoiced unit price ({inv_price}) for '{sku}' exceeds PO price ({po_price})."))
+
+        # 6. GRN Status Check (if GRN exists)
         if grn_data:
             grn_status = grn_data.get("status")
             if grn_status != "RECEIVED":
                 discrepancies.append(("GRN_NOT_RECEIVED", f"Goods Receipt status is '{grn_status}', not RECEIVED."))
 
-        # 7. Save Audit Report to Disk for THIS ONE ORDER
+        # 7. Save Audit Report to Disk
         save_audit_report(invoice_number, discrepancies)
         print("-" * 50)
 
 def save_audit_report(invoice_number, discrepancies):
-    """Saves the individual order's audit report into a JSON file on disk."""
     audit_file = AUDIT_DIR / f"audit_{invoice_number}.json"
-    
     status = "FLAGGED" if discrepancies else "APPROVED"
     report_data = {
         "invoice_number": invoice_number,
