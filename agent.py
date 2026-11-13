@@ -52,8 +52,18 @@ def record_outcome(file_name, summary):
     The AI's own recommendation is never trusted alone: the checks are repeated without the AI."""
     problems = verify_invoice(file_name)
     reason = review_reason(file_name)
-    if problems and not reason:
-        reason = "Safety check found: " + " | ".join(problems)
+    reasons = []
+
+    if reason:
+        reasons.append(reason.strip())
+
+    for problem in problems:
+        if problem and problem not in reasons:
+            reasons.append(problem)
+
+    reason = " | ".join(reasons) if reasons else None
+
+    if problems:
         log_step("agent:safety_override", {"file": file_name, "problems": problems})
     recommendation = "NEEDS_HUMAN_REVIEW" if reason else "READY_FOR_APPROVAL"
     request_id = save_approval_request(file_name, recommendation, summary, reason)
