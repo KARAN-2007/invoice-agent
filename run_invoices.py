@@ -10,13 +10,49 @@ CACHE_DIR = Path(__file__).parent / "extracted"
 CACHE_DIR.mkdir(exist_ok=True)
 
 
+CACHE_VERSION = 2
+
+
 def get_invoice_data(path):
+    path = Path(path)
+
     cache_file = CACHE_DIR / (path.name + ".json")
+    source_stat = path.stat()
+
+    # Reuse cache only if it was created with the current version.
     if cache_file.exists():
-        return json.loads(cache_file.read_text(encoding="utf-8"))
+        try:
+            cached = json.loads(
+                cache_file.read_text(encoding="utf-8")
+            )
+
+            if (
+                isinstance(cached, dict)
+                and cached.get("_cache_version") == CACHE_VERSION
+                and cached.get("_source_size") == source_stat.st_size
+                and cached.get("_source_mtime_ns") == source_stat.st_mtime_ns
+            ):
+                return cached.get("data")
+
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Extract the invoice again if the cache is outdated.
     data = extract_invoice(str(path))
+
     if data is not None:
-        cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        cache_data = {
+            "_cache_version": CACHE_VERSION,
+            "_source_size": source_stat.st_size,
+            "_source_mtime_ns": source_stat.st_mtime_ns,
+            "data": data
+        }
+
+        cache_file.write_text(
+            json.dumps(cache_data, indent=2),
+            encoding="utf-8"
+        )
+
     return data
 
 
