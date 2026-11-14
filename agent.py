@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 
 from agent_tools import (
+    check_dataset_rules,
     check_invoice_math,
     check_vendor_matches_po,
     log_step,
@@ -37,14 +38,18 @@ Work through these steps in order:
 1. Call read_invoice to get the invoice data.
 2. Call check_invoice_math to check its arithmetic.
 3. If the invoice has a PO number, call lookup_po with it exactly as printed.
-4. If lookup_po found a PO (status found or guessed), call check_vendor_matches_po.
-5. If anything is missing, wrong, guessed, ambiguous or not found, call send_to_human_review once, with a clear reason that lists every problem.
+4. If lookup_po found a PO, call check_vendor_matches_po.
+5. Always call check_dataset_rules exactly once.
+6. Use the recommendation and findings returned by check_dataset_rules.
+7. If the recommendation is NEEDS_HUMAN_REVIEW, call send_to_human_review once with all the returned reason codes.
 
 Rules:
-- Never invent or correct a PO number, a vendor or an amount yourself. Only report what the tools return.
+- Never invent or correct a PO number, vendor or amount.
+- Never override the deterministic dataset recommendation with your own judgement.
+- PRICE_VARIANCE_WITHIN_TOLERANCE alone does not require human review.
 - You cannot approve or pay anything. A human always decides.
 - Call each tool at most once, unless it returned an error.
-- Finish with a short summary and one recommendation line: READY_FOR_APPROVAL if every check passed, otherwise NEEDS_HUMAN_REVIEW."""
+- Finish with a short summary and recommendation."""
 
 
 def record_outcome(file_name, summary):
@@ -77,7 +82,14 @@ def run_agent(file_name):
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         temperature=0,
-        tools=[read_invoice, check_invoice_math, lookup_po, check_vendor_matches_po, send_to_human_review],
+        tools=[
+    read_invoice,
+    check_invoice_math,
+    lookup_po,
+    check_vendor_matches_po,
+    check_dataset_rules,
+    send_to_human_review
+],
     )
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
