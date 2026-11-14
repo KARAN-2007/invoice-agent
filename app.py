@@ -10,7 +10,12 @@ import streamlit as st
 from agent import run_agent
 from auth import authenticate
 from db_reports import latest_log_id, log_since, recent_log
-from db_store import decide_request, list_approval_requests, save_log
+from db_store import (
+    decide_request,
+    list_approval_requests,
+    save_log,
+    save_approval_request,
+)
 from extract_invoice import SUPPORTED_TYPES
 from theme import inject_theme, LOGIN_HERO_HTML, LOGIN_FOOTER_HTML
 from reason_labels import render_reasons, short_reasons
@@ -832,29 +837,114 @@ def upload_page(user):
             st.caption(
                 "AI recommendations do not automatically approve payments."
             )
- 
     if uploaded is None or not process_clicked:
         return
- 
+
     file_name = safe_name(uploaded.name)
- 
-    (INVOICE_DIR / file_name).write_bytes(uploaded.getvalue())
- 
-    save_log(
-        "vendor:upload",
-        {"user": user["username"], "file": file_name}
-    )
- 
-    last_id = latest_log_id()
- 
-    with st.spinner("The AI agent is reading and checking your invoice..."):
-        result = run_agent(file_name)
- 
-    steps = log_since(last_id)
- 
+    file_path = INVOICE_DIR / file_name
+
+    # 1. Save the uploaded document safely.
+    try:
+        INVOICE_DIR.mkdir(parents=True, exist_ok=True)
+
+        with file_path.open("xb") as f:
+            f.write(uploaded.getvalue())
+
+    except OSError as e:
+        st.error("Could not save the uploaded invoice.")
+        st.caption(str(e)[:200])
+        return
+
+    # 2. Record the upload.
+    try:
+        save_log(
+            "vendor:upload",
+            {"user": user["username"], "file": file_name}
+        )
+    except Exception as e:
+        st.warning("The upload was saved, but its audit entry failed.")
+        st.caption(str(e)[:150])
+
+    # 3. Retrieve the starting audit log ID.
+    try:
+        last_id = latest_log_id()
+    except Exception:
+        last_id = None
+
+        st.warning(
+            "Audit tracing is temporarily unavailable. "
+            "Invoice processing will continue."
+        )
+
+    # 4. Run the AI agent safely.
+    try:
+        with st.spinner("The AI agent is reading and checking your invoice..."):
+            result = run_agent(file_name)
+
+        if not isinstance(result, dict):
+            raise RuntimeError("The agent returned an invalid result.")
+
+    except Exception as e:
+        failure_summary = (
+            "Automated processing stopped unexpectedly. "
+            "Human verification is required."
+        )
+
+        failure_reason = (
+            "INCOMPLETE_EXTRACTION | "
+            "Automated processing failed unexpectedly."
+        )
+
+        st.error(
+            "Invoice processing encountered an unexpected error. "
+            "The original document has been saved."
+        )
+        st.caption(str(e)[:200])
+
+        # Attempt to send the invoice for manual review.
+        try:
+            request_id = save_approval_request(
+                file_name,
+                "NEEDS_HUMAN_REVIEW",
+                failure_summary,
+                failure_reason
+            )
+
+            if request_id is not None:
+                st.warning(
+                    "Fallback human-review request saved as #"
+                    + str(request_id)
+                )
+            else:
+                st.error(
+                    "The fallback review request could not be saved. "
+                    "An administrator must recover this invoice."
+                )
+
+        except Exception as db_error:
+            st.error(
+                "Database recovery also failed. "
+                "The original invoice remains saved at: "
+                + file_name
+            )
+            st.caption(str(db_error)[:150])
+
+        return
+
+    # 5. Retrieve execution logs.
+    try:
+        steps = log_since(last_id) if last_id is not None else []
+    except Exception:
+        steps = []
+        st.warning(
+            "The invoice was processed, but its execution trace "
+            "could not be retrieved."
+        )
+
+    # 6. Retrieve the saved approval request.
     request_id = result.get("approval_request_id")
     request_record = None
- 
+
     if request_id is not None:
         try:
             request_record = next(
@@ -865,14 +955,19 @@ def upload_page(user):
                 None
             )
         except Exception:
-            request_record = None
- 
+            st.warning(
+                "The approval record was saved, but its details "
+                "could not be retrieved."
+            )
+
+    # 7. Display the verification report.
     render_verification_report(
         file_name,
         result,
         steps,
         request_record
     )
+
  
  
 # ---------- APPROVALS PAGE ----------
