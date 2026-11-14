@@ -78,7 +78,12 @@ def verify_invoice(file_name):
         if po_result["status"] != "found":
             problems.append(po_result["note"])
         if po_result["po"] is not None:
-            vendor_check = check_vendor(data.get("vendor"), po_result["po"]["vendor"])
+            vendor_check = check_vendor(
+                data.get("vendor"),
+                po_result["po"].get("vendor") or po_result["po"].get("vendor_name"),
+                invoice_vendor_id=data.get("vendor_id"),
+                po_vendor_id=po_result["po"].get("vendor_id")
+)
             if vendor_check["status"] != "match":
                 problems.append("Vendor mismatch: " + vendor_check["note"])
     return problems
@@ -143,7 +148,12 @@ def check_vendor_matches_po(file_name: str, po_number: str) -> dict:
     if data is None or po_result["po"] is None:
         result = {"status": "cannot_check", "note": "Invoice or PO not available."}
     else:
-        result = check_vendor(data.get("vendor"), po_result["po"]["vendor"])
+                result = check_vendor(
+            data.get("vendor"),
+            po_result["po"].get("vendor") or po_result["po"].get("vendor_name"),
+            invoice_vendor_id=data.get("vendor_id"),
+            po_vendor_id=po_result["po"].get("vendor_id")
+        )
     log_step("tool:check_vendor_matches_po", {"file": file_name, "po_number": po_number, "result": result})
     return result
 

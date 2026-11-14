@@ -1,5 +1,5 @@
 import difflib
-
+import re
 
 def to_number(value):
     """Turn 1,234.50 or a currency string or a plain number into a float. Returns None if it can't."""
@@ -122,11 +122,68 @@ def check_line_math(invoice):
 
 
 
-def check_vendor(invoice_vendor, po_vendor):
-    """Compare the vendor name on the invoice with the vendor name on the purchase order."""
-    a = (invoice_vendor or "").strip().lower()
-    b = (po_vendor or "").strip().lower()
+
+def _normalize_vendor(value):
+    """Normalize vendor IDs and names for comparison."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def check_vendor(
+    invoice_vendor,
+    po_vendor,
+    invoice_vendor_id=None,
+    po_vendor_id=None
+):
+    """Compare vendor IDs when available, otherwise compare vendor names."""
+
+    # 1. If both explicit vendor IDs exist, compare them.
+    if invoice_vendor_id and po_vendor_id:
+        invoice_id = _normalize_vendor(invoice_vendor_id)
+        po_id = _normalize_vendor(po_vendor_id)
+
+        if invoice_id == po_id:
+            return {
+                "status": "match",
+                "note": f"Vendor ID '{invoice_vendor_id}' matches the PO."
+            }
+
+        return {
+            "status": "mismatch",
+            "note": (
+                f"Invoice vendor ID '{invoice_vendor_id}' "
+                f"does not match PO vendor ID '{po_vendor_id}'."
+            )
+        }
+
+    # 2. The extracted vendor field might itself contain the vendor ID.
+    if po_vendor_id and _normalize_vendor(invoice_vendor) == _normalize_vendor(po_vendor_id):
+        return {
+            "status": "match",
+            "note": f"Invoice vendor code '{invoice_vendor}' matches the PO vendor ID."
+        }
+
+    # 3. Otherwise compare vendor names.
+    invoice_name = str(invoice_vendor or "").strip()
+    po_name = str(po_vendor or "").strip()
+
+    if not invoice_name or not po_name:
+        return {
+            "status": "cannot_check",
+            "note": "Vendor information is incomplete."
+        }
+
+    a = _normalize_vendor(invoice_name)
+    b = _normalize_vendor(po_name)
+
     score = difflib.SequenceMatcher(None, a, b).ratio()
+
     if score >= 0.85:
-        return {"status": "match", "note": f"'{invoice_vendor}' matches '{po_vendor}'"}
-    return {"status": "mismatch", "note": f"invoice says '{invoice_vendor}' but the PO says '{po_vendor}'"}
+        return {
+            "status": "match",
+            "note": f"'{invoice_name}' matches '{po_name}'."
+        }
+
+    return {
+        "status": "mismatch",
+        "note": f"Invoice says '{invoice_name}' but the PO says '{po_name}'."
+    }
