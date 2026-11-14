@@ -1,3 +1,4 @@
+
 import os
 import sys
 import time
@@ -17,7 +18,12 @@ from agent_tools import (
     send_to_human_review,
     start_run,
 )
-from db_store import save_approval_request
+
+from db_store import (
+    save_approval_request,
+    has_queued_approval_request,
+)
+
 from rules import INFO_ONLY_CODES
 
 
@@ -28,6 +34,7 @@ from rules import INFO_ONLY_CODES
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
+
 client = (
     genai.Client(
         api_key=API_KEY,
@@ -37,14 +44,27 @@ client = (
     else None
 )
 
+primary_model = os.getenv(
+    "MODEL", "gemini-3.5-flash-lite"
+).strip()
+
+fallback_models = os.getenv(
+    "FALLBACK_MODELS", ""
+).split(",")
+
+legacy_fallback = os.getenv(
+    "FALLBACK_MODEL", ""
+).strip()
+
 MODELS = []
 
-primary_model = os.getenv("MODEL", "gemini-3.5-flash-lite").strip()
-fallback_models = os.getenv("FALLBACK_MODELS", "").split(",")
-legacy_fallback = os.getenv("FALLBACK_MODEL", "").strip()
-
-for model_name in [primary_model, *fallback_models, legacy_fallback]:
+for model_name in [
+    primary_model,
+    *fallback_models,
+    legacy_fallback,
+]:
     model_name = model_name.strip()
+
     if model_name and model_name not in MODELS:
         MODELS.append(model_name)
 
@@ -52,6 +72,7 @@ if not MODELS:
     MODELS = ["gemini-3.5-flash-lite"]
 
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "2"))
+
 if MAX_ATTEMPTS < 1:
     raise ValueError("MAX_ATTEMPTS must be at least 1")
 
@@ -59,42 +80,134 @@ WAIT_SECONDS = [3, 8, 15, 30]
 
 
 # ==================================================
-# 2. SYSTEM PROMPT
+# 2. SAFE LOGGING
 # ==================================================
 
-SYSTEM_PROMPT = """You are an accounts payable agent for a university. You check one vendor invoice at a time.
+def _safe_log(step, detail):
+    """Prevent audit logging failures from stopping the agent."""
 
-Work through these steps in order:
-1. Call read_invoice to get the invoice data.
-2. Call check_invoice_math to check its arithmetic.
-3. If the invoice has a PO number, call lookup_po with it exactly as printed.
-4. If lookup_po finds the PO exactly, call check_vendor_matches_po.
-5. Always call check_dataset_rules exactly once.
-6. Treat the recommendation and findings from check_dataset_rules as authoritative.
-7. If the dataset recommendation is NEEDS_HUMAN_REVIEW, call send_to_human_review once with all returned reason codes.
-8. If the only finding is PRICE_VARIANCE_WITHIN_TOLERANCE, do not send it for human review.
+    try:
+        log_step(step, detail)
 
-Rules:
+    except Exception as exc:
+        print(
+            "[warning] Could not record event:",
+            step,
+            str(exc)[:150],
+        )
+
+
+# ==================================================
+# 3. SYSTEM PROMPT
+# ==================================================
+
+SYSTEM_PROMPT = """
+You are an accounts payable agent for a university.
+
+You check one vendor invoice at a time.
+
+Follow these steps in order:
+
+1. Call read_invoice with the exact filename supplied.
+
+2. Inspect the result.
+
+   If the result contains an error or does not contain valid
+   invoice data, call read_invoice ONE more time.
+
+   If the second attempt also fails:
+   - Do not invent invoice information.
+   - Do not guess a PO number or vendor.
+   - Continue to check_dataset_rules.
+   - Follow its recommendation.
+
+3. Call check_invoice_math using the exact filename.
+
+4. Read the PO reference from the actual read_invoice result.
+
+   Use po_reference or po_number from that result.
+
+   Never invent, reconstruct, or substitute a PO number.
+
+5. If a PO reference exists, call lookup_po with TWO arguments:
+   - file_name: the exact invoice filename
+   - po_number: the PO reference extracted from read_invoice
+
+   This tool independently verifies the PO against the original
+   invoice. Its result is authoritative.
+
+6. If lookup_po finds the PO, call check_vendor_matches_po
+   with TWO arguments:
+   - file_name: the exact invoice filename
+   - po_number: the PO reference extracted from read_invoice
+
+7. Always call check_dataset_rules exactly once.
+
+8. Treat the recommendation and findings from check_dataset_rules
+   as authoritative.
+
+9. If the deterministic recommendation is NEEDS_HUMAN_REVIEW,
+   call send_to_human_review once with all reason codes.
+
+10. If the only finding is PRICE_VARIANCE_WITHIN_TOLERANCE,
+    do not send the invoice for human review.
+
+IMPORTANT RULES:
+
 - Never invent or correct a PO number, vendor or amount.
-- Never replace the deterministic dataset recommendation with your own judgement.
-- You cannot approve or pay anything. A human always makes the final approval decision.
+- Never use a PO number that is not present in the invoice data.
+- Never claim a PO was missing without checking the actual invoice.
+- Never replace deterministic findings with your own judgement.
+- Do not mistake an informational finding for a blocking issue.
+- You cannot approve or pay anything.
+- A human always makes the final approval decision.
 - Call each tool at most once, unless it returned an error.
-- Finish with a short summary. The final program will determine the recommendation from the dataset rules.
+- Retry read_invoice only once after an error.
+- Finish with a short factual summary.
+- Mention only information supported by the tool results.
 """
 
 
 # ==================================================
-# 3. RECORD FINAL OUTCOME
+# 4. RECORD FINAL OUTCOME
 # ==================================================
 
-def record_outcome(file_name, summary, force_human_review_reason=None):
-    """Save the deterministic dataset result as the approval request."""
+def record_outcome(
+    file_name,
+    summary,
+    force_human_review_reason=None,
+):
+    """Save the deterministic recommendation and track its status."""
 
-    dataset_result = get_dataset_result(file_name)
+    try:
+        dataset_result = get_dataset_result(file_name)
 
-    # Do not depend on Gemini remembering to call the rules tool.
+    except Exception as exc:
+        dataset_result = None
+
+        _safe_log(
+            "agent:dataset_result_read_error",
+            {
+                "file": file_name,
+                "error": str(exc)[:150],
+            },
+        )
+
     if not isinstance(dataset_result, dict):
-        dataset_result = check_dataset_rules(file_name)
+
+        try:
+            dataset_result = check_dataset_rules(file_name)
+
+        except Exception as exc:
+            dataset_result = None
+
+            _safe_log(
+                "agent:dataset_rules_error",
+                {
+                    "file": file_name,
+                    "error": str(exc)[:150],
+                },
+            )
 
     if not isinstance(dataset_result, dict):
         dataset_result = {}
@@ -102,7 +215,6 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
     recommendation = dataset_result.get("recommendation")
     raw_findings = dataset_result.get("findings", [])
 
-    # Invalid rule output must fail closed to human review.
     if not isinstance(raw_findings, list):
         raw_findings = []
         recommendation = "NEEDS_HUMAN_REVIEW"
@@ -113,38 +225,62 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
         if code is not None and str(code).strip()
     ))
 
-    if recommendation not in ("READY_FOR_APPROVAL", "NEEDS_HUMAN_REVIEW"):
+    if recommendation not in (
+        "READY_FOR_APPROVAL",
+        "NEEDS_HUMAN_REVIEW",
+    ):
         recommendation = "NEEDS_HUMAN_REVIEW"
+
         if "INCOMPLETE_EXTRACTION" not in reason_codes:
             reason_codes.append("INCOMPLETE_EXTRACTION")
 
-    # Only explicitly informational findings may accompany READY_FOR_APPROVAL.
-    if any(code not in INFO_ONLY_CODES for code in reason_codes):
+    if any(
+        code not in INFO_ONLY_CODES
+        for code in reason_codes
+    ):
         recommendation = "NEEDS_HUMAN_REVIEW"
 
     if recommendation == "NEEDS_HUMAN_REVIEW" and not reason_codes:
         reason_codes = ["INCOMPLETE_EXTRACTION"]
 
     extra_note = None
+
     if force_human_review_reason:
         recommendation = "NEEDS_HUMAN_REVIEW"
         extra_note = str(force_human_review_reason)
+
         if not reason_codes:
             reason_codes = ["INCOMPLETE_EXTRACTION"]
 
-    # Keep machine-readable reason codes for reason_labels.py.
     reason_parts = list(reason_codes)
+
     if extra_note:
         reason_parts.append(extra_note)
-    review_reason_text = " | ".join(reason_parts) if reason_parts else None
+
+    review_reason_text = (
+        " | ".join(reason_parts)
+        if reason_parts
+        else None
+    )
 
     if recommendation == "NEEDS_HUMAN_REVIEW":
-        send_to_human_review(
-            file_name,
-            review_reason_text or "Manual review required.",
-        )
 
-    log_step(
+        try:
+            send_to_human_review(
+                file_name,
+                review_reason_text or "Manual review required.",
+            )
+
+        except Exception as exc:
+            _safe_log(
+                "agent:human_review_routing_error",
+                {
+                    "file": file_name,
+                    "error": str(exc)[:150],
+                },
+            )
+
+    _safe_log(
         "agent:dataset_decision",
         {
             "file": file_name,
@@ -153,21 +289,52 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
         },
     )
 
-    # This is deliberately outside the Gemini retry loop. A database error
-    # must not cause the AI to execute invoice tools again.
-    request_id = save_approval_request(
-        file_name,
-        recommendation,
-        summary,
-        review_reason_text,
-    )
+    # Save once, outside the Gemini retry loop.
+    try:
+        request_id = save_approval_request(
+            file_name,
+            recommendation,
+            summary,
+            review_reason_text,
+        )
 
-    log_step(
+    except Exception as exc:
+        request_id = None
+
+        _safe_log(
+            "agent:approval_save_error",
+            {
+                "file": file_name,
+                "error": str(exc)[:150],
+            },
+        )
+
+    # Check whether a failed database save was queued locally.
+    try:
+        recovery_queued = (
+            request_id is None
+            and has_queued_approval_request(file_name)
+        )
+
+    except Exception:
+        recovery_queued = False
+
+    if request_id is not None:
+        approval_status = "SAVED_TO_DATABASE"
+
+    elif recovery_queued:
+        approval_status = "QUEUED_LOCALLY"
+
+    else:
+        approval_status = "NOT_SAVED"
+
+    _safe_log(
         "agent:recorded",
         {
             "file": file_name,
             "recommendation": recommendation,
             "approval_request_id": request_id,
+            "approval_status": approval_status,
         },
     )
 
@@ -175,150 +342,231 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
         "summary": summary,
         "recommendation": recommendation,
         "approval_request_id": request_id,
+        "approval_saved": request_id is not None,
+        "recovery_queued": recovery_queued,
+        "approval_status": approval_status,
         "findings": reason_codes,
     }
 
 
 # ==================================================
-# 4. MAIN AGENT
+# 5. MAIN AGENT
 # ==================================================
 
 def run_agent(file_name):
-    start_run(file_name)
-    log_step("agent:start", {"file": file_name, "models": MODELS})
+    """Run Gemini tools and save the outcome once."""
+
+    try:
+        start_run(file_name)
+
+    except Exception as exc:
+        _safe_log(
+            "agent:start_run_error",
+            {
+                "file": file_name,
+                "error": str(exc)[:150],
+            },
+        )
+
+    _safe_log(
+        "agent:start",
+        {
+            "file": file_name,
+            "models": MODELS,
+        },
+    )
 
     if client is None:
-        log_step(
-            "agent:error",
-            {"error": "GEMINI_API_KEY is missing from the .env file."},
-        )
         return record_outcome(
             file_name,
-            "The AI service could not start. The invoice requires human review.",
+            "The AI service could not start. Human review is required.",
             force_human_review_reason=(
-                "The AI service could not start because GEMINI_API_KEY is missing."
+                "The AI service could not start because "
+                "GEMINI_API_KEY is missing."
             ),
         )
 
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        temperature=0,
-        tools=[
-            read_invoice,
-            check_invoice_math,
-            lookup_po,
-            check_vendor_matches_po,
-            check_dataset_rules,
-            send_to_human_review,
-        ],
-    )
+    try:
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0,
+            tools=[
+                read_invoice,
+                check_invoice_math,
+                lookup_po,
+                check_vendor_matches_po,
+                check_dataset_rules,
+                send_to_human_review,
+            ],
+        )
+
+    except Exception as exc:
+        _safe_log(
+            "agent:configuration_error",
+            {
+                "file": file_name,
+                "error": str(exc)[:150],
+            },
+        )
+
+        return record_outcome(
+            file_name,
+            "The agent configuration failed. Human review is required.",
+            force_human_review_reason="AI tool configuration failed.",
+        )
 
     summary = None
     ai_failure_reason = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
+
         model = MODELS[(attempt - 1) % len(MODELS)]
 
         try:
-            log_step(
+            _safe_log(
                 "agent:model_attempt",
-                {"attempt": attempt, "model": model},
+                {
+                    "attempt": attempt,
+                    "model": model,
+                },
             )
 
-            chat = client.chats.create(model=model, config=config)
+            chat = client.chats.create(
+                model=model,
+                config=config,
+            )
+
             response = chat.send_message(
-                "Check the invoice file " + file_name + "."
+                "Check the invoice file " + str(file_name) + "."
             )
 
-            summary = response.text or (
-                "The automated checks completed without an AI text summary."
+            summary = getattr(response, "text", None) or (
+                "Automated checks completed. "
+                "The recommendation uses deterministic rules."
             )
-            log_step("agent:finish", {"model": model, "summary": summary})
-            ai_failure_reason = None
+
+            _safe_log(
+                "agent:finish",
+                {
+                    "model": model,
+                    "summary": summary,
+                },
+            )
+
             break
 
-        except Exception as e:
-            error_text = str(e)[:200]
-            log_step(
+        except Exception as exc:
+
+            ai_failure_reason = str(exc)[:200]
+
+            _safe_log(
                 "agent:error",
                 {
                     "attempt": attempt,
                     "model": model,
-                    "error": error_text,
+                    "error": ai_failure_reason,
                 },
             )
-            ai_failure_reason = error_text
 
-            # Critical retry guard: if the deterministic rules tool already
-            # completed, do not start a fresh chat and execute tools again.
-            # Use the saved result and finish with a fallback summary instead.
-            existing_result = get_dataset_result(file_name)
+            # Do not repeat completed deterministic checks.
+            try:
+                existing_result = get_dataset_result(file_name)
+
+            except Exception:
+                existing_result = None
+
             if isinstance(existing_result, dict):
+
                 summary = (
-                    "The deterministic invoice checks completed, but the AI "
-                    "response timed out before a final summary was returned. "
-                    "The recommendation below is based on the saved dataset checks."
+                    "Deterministic checks completed, but Gemini "
+                    "failed to return its final summary. "
+                    "The recommendation uses the saved rule results."
                 )
-                log_step(
+
+                _safe_log(
                     "agent:retry_suppressed",
                     {
                         "file": file_name,
                         "reason": "dataset_result_already_available",
-                        "attempt": attempt,
                     },
                 )
+
                 break
 
             if attempt < MAX_ATTEMPTS:
+
                 wait = WAIT_SECONDS[
                     min(attempt - 1, len(WAIT_SECONDS) - 1)
                 ]
-                log_step("agent:retry", {"waiting_seconds": wait})
+
+                _safe_log(
+                    "agent:retry",
+                    {
+                        "waiting_seconds": wait,
+                    },
+                )
+
                 time.sleep(wait)
 
     if summary is None:
-        log_step(
+
+        _safe_log(
             "agent:gave_up",
-            {"file": file_name, "models_tried": MODELS},
+            {
+                "file": file_name,
+                "models_tried": MODELS,
+            },
         )
-        summary = (
-            "The automated AI summary could not be completed. "
-            "The invoice was routed for human review."
-        )
+
         return record_outcome(
             file_name,
-            summary,
+            (
+                "The AI service could not complete processing. "
+                "Human review is required."
+            ),
             force_human_review_reason=(
-                "The AI service was unavailable after all configured attempts. "
-                + (ai_failure_reason or "No additional error details were returned.")
+                "AI service unavailable after configured attempts. "
+                + (ai_failure_reason or "")
             ),
         )
 
-    # Record the outcome once, after the AI retry loop has ended. Exceptions
-    # here are database/application errors, not reasons to rerun Gemini tools.
+    # Never rerun Gemini because approval saving failed.
     return record_outcome(file_name, summary)
 
 
 # ==================================================
-# 5. DIRECT EXECUTION
+# 6. DIRECT EXECUTION
 # ==================================================
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "invoice3.pdf"
+
+    name = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "invoice3.pdf"
+    )
+
     print("=== Agent checking " + name + " ===")
+
     result = run_agent(name)
 
-    print("\n" + (result["summary"] or "The automated check could not finish."))
-    print("\nRecommendation: " + result["recommendation"])
+    print("\n" + result["summary"])
+
+    print("\nRecommendation:", result["recommendation"])
+
+    print("Approval status:", result["approval_status"])
 
     if result["approval_request_id"] is not None:
         print(
-            "Saved as approval request #"
-            + str(result["approval_request_id"])
-            + ". A human must approve or reject it."
+            "Database request ID:",
+            result["approval_request_id"],
         )
-    else:
-        print("Could not save the approval request (database unavailable).")
 
-    if result.get("findings"):
-        print("Reason codes: " + ", ".join(result["findings"]))
+    elif result["recovery_queued"]:
+        print("Approval request is waiting for database recovery.")
+
+    else:
+        print("Approval request could not be saved.")
+
+    if result["findings"]:
+        print("Reason codes:", ", ".join(result["findings"]))
