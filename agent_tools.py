@@ -6,12 +6,14 @@ from checks import check_line_math, check_vendor
 from db_store import save_log
 from run_invoices import get_invoice_data
 from tools import find_po
+from rules import evaluate_invoice
 
 INVOICE_DIR = Path(__file__).parent / "invoices"
 LOG_FILE = Path(__file__).parent / "agent_log.jsonl"
 
 # Invoices sent to human review during the current run, with the reason given
 _review_reasons = {}
+_dataset_results = {}
 _db_warning_shown = False
 
 
@@ -142,6 +144,46 @@ def check_vendor_matches_po(file_name: str, po_number: str) -> dict:
     log_step("tool:check_vendor_matches_po", {"file": file_name, "po_number": po_number, "result": result})
     return result
 
+def check_dataset_rules(file_name: str) -> dict:
+    """Run deterministic invoice checks using the procurement dataset."""
+
+    try:
+        data = _load_invoice(file_name)
+
+        if data is None:
+            result = {
+                "case_id": file_name,
+                "recommendation": "NEEDS_HUMAN_REVIEW",
+                "findings": ["INCOMPLETE_EXTRACTION"]
+            }
+        else:
+            invoice_record = {
+                "case_id": file_name,
+                "document": data
+            }
+
+            result = evaluate_invoice(invoice_record)
+
+    except Exception as e:
+        result = {
+            "case_id": file_name,
+            "recommendation": "NEEDS_HUMAN_REVIEW",
+            "findings": ["INCOMPLETE_EXTRACTION"],
+            "error": str(e)[:150]
+        }
+
+    _dataset_results[file_name] = result
+
+    log_step(
+        "tool:check_dataset_rules",
+        {"file": file_name, "result": result}
+    )
+
+    return result
+
+
+def get_dataset_result(file_name):
+    return _dataset_results.get(file_name)
 
 def send_to_human_review(file_name: str, reason: str) -> dict:
     """Sends the invoice to a human reviewer. Use this whenever anything is missing, wrong,
