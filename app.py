@@ -22,7 +22,7 @@ from reason_labels import render_reasons, short_reasons
  
  
 INVOICE_DIR = Path(__file__).parent / "invoices"
-EXTRACTED_DIR = Path(__file__).parent / "extracted"
+EXTRACTED_DIR = Path(__file__).parent / "data" / "invoices"
  
 ROLE_PAGES = {
     "vendor": ["Upload invoice"],

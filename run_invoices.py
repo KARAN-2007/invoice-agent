@@ -6,9 +6,8 @@ from extract_invoice import extract_invoice, SUPPORTED_TYPES
 from tools import find_po
 
 INVOICE_DIR = Path(__file__).parent / "invoices"
-CACHE_DIR = Path(__file__).parent / "extracted"
-CACHE_DIR.mkdir(exist_ok=True)
-
+CACHE_DIR = Path(__file__).parent / "data" / "invoices"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CACHE_VERSION = 2
 
