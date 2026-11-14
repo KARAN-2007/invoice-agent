@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
 # Point to your folders
@@ -8,7 +9,7 @@ INV_DIR = Path("data/invoices")
 AUDIT_DIR = Path("data/audit_reports")
 
 def process_orders_sequentially():
-    print("📂 Starting live order-by-order processing with item-level matching...\n")
+    print("📂 Starting live order-by-order processing (with timestamped audit files)...\n")
 
     if not INV_DIR.exists():
         print("⚠️ Invoices folder does not exist!")
@@ -26,18 +27,24 @@ def process_orders_sequentially():
         invoice_number = invoice_data.get("invoice_number")
         invoice_items = invoice_data.get("items", [])
 
-        print(f"📄 Processing Order: Invoice #{invoice_number} (PO #{po_id})")
+        # 1. CHECK IF ANY AUDIT REPORT FOR THIS INVOICE ALREADY EXISTS
+        existing_audits = list(AUDIT_DIR.glob(f"audit_{invoice_number}_*.json"))
+        if existing_audits:
+            print(f"⏩ Skipping Invoice #{invoice_number} (Audit report already exists on disk).")
+            continue
+
+        print(f"📄 Processing New Order: Invoice #{invoice_number} (PO #{po_id})")
 
         discrepancies = []
 
-        # 1. Duplicate Invoice Check
+        # 2. Duplicate Invoice Check
         inv_key = (vendor_id, invoice_number)
         if inv_key in seen_invoices:
             discrepancies.append(("DUPLICATE_INVOICE", f"Invoice '{invoice_number}' was already submitted."))
         else:
             seen_invoices.add(inv_key)
 
-        # 2. Fetch matching PO file on-demand
+        # 3. Fetch matching PO file on-demand
         po_data = None
         po_file = PO_DIR / f"po_{po_id}.json"
         if po_file.exists():
@@ -46,7 +53,7 @@ def process_orders_sequentially():
         else:
             discrepancies.append(("MISSING_PO", f"Purchase Order file for PO #{po_id} is missing."))
 
-        # 3. Fetch matching GRN file on-demand
+        # 4. Fetch matching GRN file on-demand
         grn_data = None
         grn_file = GRN_DIR / f"grn_{po_id}.json"
         if grn_file.exists():
@@ -55,19 +62,16 @@ def process_orders_sequentially():
         else:
             discrepancies.append(("MISSING_GRN", f"Goods Receipt file for PO #{po_id} is missing."))
 
-        # 4. Header-level & Item-level Matching (if PO exists)
+        # 5. Header-level & Item-level Matching (if PO exists)
         if po_data:
             po_total = float(po_data.get("total_amount", 0))
             inv_total = float(invoice_data.get("total_amount", 0))
 
-            # Total amount variance check
             if inv_total > po_total:
                 discrepancies.append(("PRICE_HIKE", f"Invoice total ({inv_total}) exceeds PO total ({po_total})."))
 
-            # Build a lookup dictionary for PO items (SKU -> item details)
             po_items_map = {item["sku"]: item for item in po_data.get("items", [])}
 
-            # 5. Item-by-Item Line Matching
             for inv_item in invoice_items:
                 sku = inv_item.get("sku")
                 inv_qty = inv_item.get("quantity", 0)
@@ -80,11 +84,9 @@ def process_orders_sequentially():
                     po_qty = po_item.get("quantity", 0)
                     po_price = po_item.get("unit_price", 0)
 
-                    # Check for quantity over-invoicing
                     if inv_qty > po_qty:
                         discrepancies.append(("QUANTITY_MISMATCH", f"Invoiced qty ({inv_qty}) for '{sku}' exceeds PO qty ({po_qty})."))
 
-                    # Check for unit price hikes
                     if inv_price > po_price:
                         discrepancies.append(("UNIT_PRICE_HIKE", f"Invoiced unit price ({inv_price}) for '{sku}' exceeds PO price ({po_price})."))
 
@@ -94,23 +96,27 @@ def process_orders_sequentially():
             if grn_status != "RECEIVED":
                 discrepancies.append(("GRN_NOT_RECEIVED", f"Goods Receipt status is '{grn_status}', not RECEIVED."))
 
-        # 7. Save Audit Report to Disk
+        # 7. Save Timestamped Audit Report to Disk
         save_audit_report(invoice_number, discrepancies)
         print("-" * 50)
 
 def save_audit_report(invoice_number, discrepancies):
-    audit_file = AUDIT_DIR / f"audit_{invoice_number}.json"
+    # Generate current date and time string (e.g., "2026-11-15_02-58-12")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    audit_file = AUDIT_DIR / f"audit_{invoice_number}_{timestamp}.json"
+    
     status = "FLAGGED" if discrepancies else "APPROVED"
     report_data = {
         "invoice_number": invoice_number,
         "status": status,
+        "generated_at": timestamp,
         "discrepancies": [{"type": d[0], "details": d[1]} for d in discrepancies]
     }
 
     with open(audit_file, "w", encoding="utf-8") as f:
         json.dump(report_data, f, indent=4)
 
-    print(f"📋 Audit saved to disk: {audit_file} [{status}]")
+    print(f"📋 Timestamped audit saved to disk: {audit_file.name} [{status}]")
 
 if __name__ == "__main__":
     process_orders_sequentially()
