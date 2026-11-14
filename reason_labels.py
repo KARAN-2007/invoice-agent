@@ -117,11 +117,18 @@ def render_reasons(value):
         st.warning("The agent flagged this invoice: " + (text or "No specific reason was provided."))
         return
 
-    st.markdown("**Why it was flagged**")
-    st.markdown("".join(badge_html(c) for c in codes), unsafe_allow_html=True)
-    for code in codes:
-        if code in REASONS:
-            st.caption("**" + REASONS[code][0] + ":** " + REASONS[code][2])
+    informational_only = all(
+    reason_severity(code) == "info" for code in codes
+)
+
+    if informational_only:
+        st.markdown("**Informational checks**")
+    else:
+        st.markdown("**Why it was flagged**")
+        st.markdown("".join(badge_html(c) for c in codes), unsafe_allow_html=True)
+        for code in codes:
+            if code in REASONS:
+                st.caption("**" + REASONS[code][0] + ":** " + REASONS[code][2])
 
     # If the agent wrote a sentence as well as the codes, keep it available
     leftover = _CODE_PATTERN.sub("", text)

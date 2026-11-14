@@ -960,12 +960,16 @@ def approvals_page(user):
                 with detail_left:
                     st.markdown("**AI assessment**")
  
-                    if needs_review:
-                        render_reasons(req["review_reason"])
+                    review_reason_text = req.get("review_reason") or ""
+
+                    if review_reason_text:
+                        render_reasons(review_reason_text)
+                    elif needs_review:
+                        render_reasons(review_reason_text)
                     else:
                         st.success(
-                            "The agent found no problems in its checks."
-                        )
+                            "The agent found no blocking issues in its checks."
+    )
  
                     if req["summary"]:
                         st.markdown("**Agent summary**")
