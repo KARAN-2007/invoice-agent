@@ -33,7 +33,11 @@ for model_name in [MAIN_MODEL] + fallback_candidates:
     if model_name and model_name not in MODELS:
         MODELS.append(model_name)
 
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "2"))
+
+if MAX_ATTEMPTS < 1:
+    raise ValueError("MAX_ATTEMPTS must be at least 1")
+
 WAIT_SECONDS = [3, 8, 15]
 
 # Ask for both the existing invoice fields and the additional
@@ -317,8 +321,17 @@ def extract_invoice(file_path):
     if client is None:
         raise ValueError("GEMINI_API_KEY is missing from the .env file.")
 
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
+    # Safely read the invoice file.
+    try:
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+    except OSError as e:
+        print(
+            "[extraction error] Could not read invoice:",
+            str(e)[:150],
+        )
+        return None
 
     file_part = types.Part.from_bytes(
         data=file_bytes,
@@ -342,7 +355,9 @@ def extract_invoice(file_path):
             normalized = normalize_invoice_data(extracted)
 
             if normalized is None:
-                raise ValueError("The extracted response was not a JSON object or list.")
+                raise ValueError(
+                    "The extracted response was not a JSON object or list."
+                )
 
             return normalized
 
@@ -357,7 +372,11 @@ def extract_invoice(file_path):
             )
 
             if attempt < MAX_ATTEMPTS:
-                time.sleep(WAIT_SECONDS[min(attempt - 1, len(WAIT_SECONDS) - 1)])
+                time.sleep(
+                    WAIT_SECONDS[
+                        min(attempt - 1, len(WAIT_SECONDS) - 1)
+                    ]
+                )
 
     return None
 

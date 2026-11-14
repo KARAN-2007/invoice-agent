@@ -46,11 +46,14 @@ def require_role(user, allowed):
         st.error("Your role is not allowed to open this page.")
         st.stop()
  
- 
 def safe_name(original):
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", original)
-    return "upload_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + cleaned
- 
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+
+    return "upload_" + timestamp + "_" + cleaned
  
 def money(value):
     try:
@@ -59,21 +62,32 @@ def money(value):
         return "-" if value is None else str(value)
  
  
+
 def load_extracted(file_name):
     path = EXTRACTED_DIR / (file_name + ".json")
- 
+
     if not path.exists():
         return None
- 
+
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
- 
+
+    # Support the new versioned extraction cache.
+    if (
+        isinstance(data, dict)
+        and "_cache_version" in data
+        and "data" in data
+    ):
+        data = data["data"]
+
+    # Support files containing multiple extracted invoices.
     if isinstance(data, list):
         data = data[0] if data else None
- 
+
     return data if isinstance(data, dict) else None
+
  
  
 def show_invoice(file_name):
