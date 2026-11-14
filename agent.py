@@ -72,7 +72,7 @@ def record_outcome(file_name, summary):
 
 
 def run_agent(file_name):
-    start_run()
+    start_run(file_name)
     log_step("agent:start", {"file": file_name, "models": MODELS})
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,

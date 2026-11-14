@@ -15,9 +15,9 @@ _review_reasons = {}
 _db_warning_shown = False
 
 
-def start_run():
-    """Call this once at the start of each agent run, before any retries."""
-    _review_reasons.clear()
+def start_run(file_name):
+    """Clear only this invoice's previous review reason."""
+    _review_reasons.pop(file_name, None)
 
 
 def review_reason(file_name):
@@ -38,8 +38,10 @@ def log_step(step, detail):
 
 
 def _load_invoice(file_name):
-    path = INVOICE_DIR / file_name
-    if not path.exists():
+    invoice_dir = INVOICE_DIR.resolve()
+    path = (invoice_dir / file_name).resolve()
+
+    if path.parent != invoice_dir or not path.is_file():
         return None
     try:
         data = get_invoice_data(path)
