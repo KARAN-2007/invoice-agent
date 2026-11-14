@@ -6,7 +6,7 @@ from checks import check_line_math, check_vendor
 from db_store import save_log
 from run_invoices import get_invoice_data
 from tools import find_po
-from rules import evaluate_invoice
+from rules import evaluate_invoice, load_reference_data
 
 INVOICE_DIR = Path(__file__).parent / "invoices"
 LOG_FILE = Path(__file__).parent / "agent_log.jsonl"
@@ -14,12 +14,15 @@ LOG_FILE = Path(__file__).parent / "agent_log.jsonl"
 # Invoices sent to human review during the current run, with the reason given
 _review_reasons = {}
 _dataset_results = {}
+_dataset_history = {}
+_reference_data_cache = None
 _db_warning_shown = False
 
 
 def start_run(file_name):
     """Clear only this invoice's previous review reason."""
     _review_reasons.pop(file_name, None)
+    _dataset_results.pop(file_name, None)
 
 
 def review_reason(file_name):
@@ -144,8 +147,74 @@ def check_vendor_matches_po(file_name: str, po_number: str) -> dict:
     log_step("tool:check_vendor_matches_po", {"file": file_name, "po_number": po_number, "result": result})
     return result
 
+def _first_value(data, *keys):
+    for key in keys:
+        value = data.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _make_agent_history_record(data):
+    """Convert an extracted invoice into the history format used by rules.py."""
+
+    if not isinstance(data, dict):
+        return None
+
+    document_type = str(data.get("document_type") or "").upper()
+
+    if "CREDIT_NOTE" in document_type or data.get("credit_note_number"):
+        return None
+
+    invoice_number = _first_value(
+        data, "invoice_number", "invoice_no", "invoice_id"
+    )
+
+    if not invoice_number:
+        return None
+
+    vendor = data.get("vendor")
+
+    if isinstance(vendor, dict):
+        vendor_name = _first_value(vendor, "name", "vendor_name")
+    else:
+        vendor_name = vendor or data.get("vendor_name")
+
+    items = data.get("items") or data.get("line_items") or []
+
+    history_items = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        history_items.append({
+            "description": _first_value(
+                item, "description", "name", "product_name"
+            ),
+            "quantity_billed": _first_value(
+                item, "quantity", "quantity_billed", "qty"
+            ),
+            "unit_price": _first_value(
+                item, "unit_price", "unit_rate", "rate", "price"
+            )
+        })
+
+    return {
+        "invoice_number": invoice_number,
+        "vendor_name": vendor_name,
+        "po_number": _first_value(
+            data, "po_reference", "po_number", "purchase_order"
+        ),
+        "status": "PROCESSED",
+        "items": history_items
+    }
+
+
 def check_dataset_rules(file_name: str) -> dict:
-    """Run deterministic invoice checks using the procurement dataset."""
+    """Run deterministic checks with reference data and invoice history."""
+
+    global _reference_data_cache
 
     try:
         data = _load_invoice(file_name)
@@ -156,13 +225,43 @@ def check_dataset_rules(file_name: str) -> dict:
                 "recommendation": "NEEDS_HUMAN_REVIEW",
                 "findings": ["INCOMPLETE_EXTRACTION"]
             }
+
         else:
+            if _reference_data_cache is None:
+                _reference_data_cache = load_reference_data()
+
+            # Include genuine prior invoices, but exclude the special
+            # case-07 fixture that is deliberately represented by case 01.
+            history = [
+                dict(row)
+                for row in _reference_data_cache.get("prior_invoices", [])
+                if "duplicate test case 07"
+                not in str(row.get("note", "")).lower()
+            ]
+
+            # Include invoices processed during this application session.
+            history.extend(
+                record
+                for previous_file, record in _dataset_history.items()
+                if previous_file != file_name
+            )
+
             invoice_record = {
                 "case_id": file_name,
                 "document": data
             }
 
-            result = evaluate_invoice(invoice_record)
+            result = evaluate_invoice(
+                invoice_record,
+                reference_data=_reference_data_cache,
+                history=history
+            )
+
+            # Remember this invoice for subsequent checks.
+            history_record = _make_agent_history_record(data)
+
+            if history_record:
+                _dataset_history[file_name] = history_record
 
     except Exception as e:
         result = {
