@@ -3,7 +3,9 @@ import csv
 import hashlib
 import io
 import json
+from po_pages import render_po_page
 from pathlib import Path
+from grn_pages import render_grn_page
 
 import streamlit as st
 
@@ -27,10 +29,10 @@ EXTRACTED_DIR = Path(__file__).parent / "data" / "invoices"
 
 ROLE_PAGES = {
     "vendor": ["Upload invoice"],
+    "procurement_officer": ["Purchase Orders","Goods Receipts"],
     "approver": ["Approvals"],
     "admin": ["Audit log"],
 }
-
 
 st.set_page_config(
     page_title="Invoice agent",
@@ -2007,7 +2009,16 @@ st.sidebar.divider()
 
 st.sidebar.markdown("**Current workspace**")
 
-page = ROLE_PAGES[user["role"]][0]
+available_pages = ROLE_PAGES[user["role"]]
+
+if len(available_pages) > 1:
+    page = st.sidebar.selectbox(
+        "Select workspace",
+        available_pages,
+        key="admin_workspace",
+    )
+else:
+    page = available_pages[0]
 
 sidebar_page_html = (
     '<div style="background:rgba(255,255,255,0.10);'
@@ -2050,5 +2061,11 @@ if page == "Upload invoice":
 elif page == "Approvals":
     approvals_page(user)
 
+elif page == "Purchase Orders":
+    render_po_page(user)
+
 elif page == "Audit log":
     audit_page(user)
+
+elif page == "Goods Receipts":
+    render_grn_page(user)
