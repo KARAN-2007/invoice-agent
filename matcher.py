@@ -463,6 +463,85 @@ def save_audit_report(
     return audit_file
 
 
+def process_invoice_record(
+    invoice_path: Path | str,
+    base_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Match one newly saved canonical invoice and write its audit report.
+
+    ``invoice_path`` should be the path returned by ``save_invoice``. Only a
+    canonical ``inv_*.json`` file directly inside ``data/invoices`` is accepted;
+    extraction-cache JSON files are deliberately rejected.
+    """
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    invoice_dir = root / "data" / "invoices"
+
+    supplied_path = Path(invoice_path)
+    if not supplied_path.is_absolute():
+        # Support both paths returned relative to the project root and paths
+        # already expressed relative to the current working directory.
+        if not supplied_path.exists():
+            supplied_path = root / supplied_path
+
+    try:
+        canonical_path = supplied_path.resolve()
+        expected_dir = invoice_dir.resolve()
+    except OSError as exc:
+        raise ValueError(f"Could not resolve canonical invoice path: {exc}") from exc
+
+    if (
+        canonical_path.parent != expected_dir
+        or not canonical_path.name.startswith("inv_")
+        or canonical_path.suffix.lower() != ".json"
+    ):
+        raise ValueError(
+            "Three-way matching accepts only canonical data/invoices/inv_<po_id>.json records."
+        )
+
+    invoice = _load_json(canonical_path)
+    if invoice is None:
+        raise ValueError(f"Could not load canonical invoice record: {canonical_path.name}")
+
+    invoice_records: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(invoice_dir.glob("inv_*.json")):
+        record = _load_json(path)
+        if record is not None:
+            invoice_records.append((path, record))
+
+    duplicate_keys = _duplicate_invoice_keys(invoice_records)
+    po_id = _first_value(
+        invoice.get("po_id"),
+        invoice.get("purchase_order_id"),
+        invoice.get("po_number"),
+    )
+    key = _po_key(po_id)
+    po_dir = root / "data" / "purchase_orders"
+    grn_dir = root / "data" / "goods_receipts"
+    po_path = po_dir / f"po_{key}.json" if key else None
+    grn_path = grn_dir / f"grn_{key}.json" if key else None
+
+    po = _load_json(po_path) if po_path is not None and po_path.is_file() else None
+    grn = _load_json(grn_path) if grn_path is not None and grn_path.is_file() else None
+
+    report = _build_report(canonical_path, invoice, po, grn, duplicate_keys)
+    audit_path = save_audit_report(
+        report.get("invoice_number") or canonical_path.stem,
+        report,
+        base_dir=root,
+    )
+
+    result = dict(report)
+    result["audit_report_path"] = str(audit_path)
+    print(
+        f"📄 {result.get('invoice_number') or canonical_path.name}: "
+        f"{result['matching_result']} — {result['status']}"
+    )
+    for finding in result["discrepancies"]:
+        print(f"   - {finding['type']}: {finding['details']}")
+    print(f"📋 Audit saved: {audit_path.relative_to(root)}")
+    return result
+
+
 def process_orders_sequentially(base_dir: Path | str | None = None) -> list[dict[str, Any]]:
     """Run matching for canonical invoices only and write one report per invoice."""
     root = Path(base_dir) if base_dir is not None else BASE_DIR

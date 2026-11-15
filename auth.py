@@ -12,7 +12,10 @@ ITERATIONS = 200_000
 ALLOWED_ROLES = {
     "vendor",
     "procurement_officer",
-    "approver",
+    "department_head",
+    "finance_officer",
+    "final_approver",
+    "approver",  # Backward-compatible alias for the final approval stage.
     "admin",
 }
 

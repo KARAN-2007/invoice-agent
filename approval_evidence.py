@@ -94,11 +94,16 @@ def build_approval_evidence(file_name: str, audit_rows: list[dict[str, Any]]) ->
     budget_event = _latest_event(
         matching_events,
         {
+            "tool:check_department_budget",
             "tool:check_budget",
             "tool:validate_budget",
             "budget:checked",
             "budget:validated",
         },
+    )
+    matching_event = _latest_event(
+        matching_events,
+        {"matcher:three_way_match"},
     )
 
     read_result = _event_result(read_event)
@@ -174,24 +179,81 @@ def build_approval_evidence(file_name: str, audit_rows: list[dict[str, Any]]) ->
     else:
         grn = ("No GRN exception flagged", "info", "Dataset rules reported no GRN exception; inspect the PO/GRN records before approval.")
 
-    # Budget: only show a result if an explicit budget event/finding exists.
-    if findings & _BUDGET_EXCEEDED_CODES:
+    # Budget: prefer the explicit department-budget tool result. Its contract
+    # uses budget_ok=True/False/None rather than a status string. A None value
+    # must remain unverified; it must never be interpreted as zero consumption.
+    if budget_event is not None:
+        budget_result = _event_result(budget_event)
+        budget_note = str(budget_result.get("note") or "").strip()
+        budget_ok = budget_result.get("budget_ok")
+
+        if budget_ok is True:
+            budget = (
+                "Within limit",
+                "passed",
+                budget_note or "The department budget checker confirmed sufficient remaining budget.",
+            )
+        elif budget_ok is False:
+            budget = (
+                "Limit exceeded",
+                "issue",
+                budget_note or "The department budget checker found that the invoice exceeds the remaining budget.",
+            )
+        elif budget_ok is None and "budget_ok" in budget_result:
+            budget = (
+                "Not verified",
+                "warning",
+                budget_note or "The department budget could not be verified.",
+            )
+        else:
+            budget_status = str(
+                budget_result.get("status")
+                or budget_result.get("recommendation")
+                or ""
+            ).upper()
+            if budget_status in {"PASSED", "WITHIN_LIMIT", "OK", "READY"}:
+                budget = ("Within limit", "passed", budget_note or "Budget validation was recorded as successful.")
+            elif budget_status in {"EXCEEDED", "FAILED"}:
+                budget = ("Limit exceeded", "issue", budget_note or "Budget validation found an over-limit amount.")
+            elif budget_status in {"NOT_VERIFIED", "UNMAPPED", "UNKNOWN", "INCOMPLETE"}:
+                budget = ("Not verified", "warning", budget_note or "The department budget could not be verified.")
+            elif budget_status == "NEEDS_HUMAN_REVIEW":
+                budget = ("Needs review", "issue", budget_note or "Budget validation requires human review.")
+            else:
+                budget = ("Inconclusive", "warning", "A budget event exists but has no recognised result.")
+    elif findings & _BUDGET_EXCEEDED_CODES:
         budget = ("Limit exceeded", "issue", "The recorded budget validation found an over-limit amount.")
     elif findings & _BUDGET_UNMAPPED_CODES:
         budget = ("Not verified", "warning", "The PO has no confirmed department/cost-centre mapping.")
     elif findings & _BUDGET_PASSED_CODES:
         budget = ("Within limit", "passed", "An explicit budget validation result was recorded.")
-    elif budget_event is not None:
-        budget_result = _event_result(budget_event)
-        budget_status = str(budget_result.get("status") or budget_result.get("recommendation") or "").upper()
-        if budget_status in {"PASSED", "WITHIN_LIMIT", "OK", "READY"}:
-            budget = ("Within limit", "passed", str(budget_result.get("note") or "Budget validation was recorded as successful."))
-        elif budget_status in {"EXCEEDED", "NEEDS_HUMAN_REVIEW", "FAILED", "UNMAPPED"}:
-            budget = ("Needs review", "issue", str(budget_result.get("note") or "Budget validation requires review."))
-        else:
-            budget = ("Inconclusive", "warning", "A budget event exists but has no recognised status.")
     else:
-        budget = ("Not verified", "warning", "Live department-budget validation is not connected yet.")
+        budget = ("Not verified", "warning", "No department-budget validation result was recorded for this invoice.")
+
+    # Three-way matcher evidence is kept separate from the agent's dataset rules.
+    matching_result = _event_result(matching_event)
+    matching_outcome = str(matching_result.get("matching_result") or "").upper()
+    matching_findings = matching_result.get("discrepancies")
+    if not isinstance(matching_findings, list):
+        matching_findings = []
+
+    if matching_event is None:
+        matching = ("Not recorded", "warning", "No three-way matching event was recorded for this invoice.")
+    elif matching_outcome == "NO_DISCREPANCIES_FOUND" and not matching_findings:
+        matching = ("No discrepancies", "passed", "The matcher found no discrepancies. Human approval is still required.")
+    elif matching_findings or matching_outcome == "DISCREPANCIES_FOUND":
+        finding_details = [
+            str(item.get("type") or "ISSUE") + ": " + str(item.get("details") or "")
+            for item in matching_findings[:5]
+            if isinstance(item, dict)
+        ]
+        matching = (
+            "Discrepancies found",
+            "issue",
+            "; ".join(finding_details) or "The matcher flagged this invoice for human review.",
+        )
+    else:
+        matching = ("Inconclusive", "warning", "The matcher event did not contain a recognised matching result.")
 
     cards = [
         ("Invoice extraction", extraction),
@@ -199,6 +261,7 @@ def build_approval_evidence(file_name: str, audit_rows: list[dict[str, Any]]) ->
         ("PO lookup", purchase_order),
         ("Vendor matching", vendor),
         ("GRN verification", grn),
+        ("Three-way matching", matching),
         ("Budget validation", budget),
     ]
 
@@ -234,4 +297,4 @@ def render_approval_evidence(file_name: str, audit_rows: list[dict[str, Any]]) -
                         st.info(item["status"])
                     st.caption(item["detail"])
 
-    st.caption("A human approver remains responsible for the final decision. Budget verification must be connected to the authoritative backend before it can be treated as complete.")
+    st.caption("A human approver remains responsible for the final decision. Checks without recorded evidence are never treated as passed.")
