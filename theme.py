@@ -27,9 +27,7 @@ CSS = """
 /* ---------- BACKGROUND ---------- */
 
 [data-testid='stAppViewContainer'] {
-  position:relative !important;
-  isolation:isolate !important;
-  min-height:100vh !important;
+  /* Keep Streamlit's native viewport and scroll layout intact. */
   background:
     radial-gradient(900px circle at 100% 0%, rgba(56,189,248,.45), transparent 60%),
     radial-gradient(800px circle at 100% 100%, rgba(168,85,247,.40), transparent 60%),
@@ -119,7 +117,18 @@ footer {
 
 .block-container {
   max-width:1480px;
-  padding:1.2rem 2rem 2.5rem;
+  /* Extra end space lets the final cards/expanders scroll fully into view. */
+  padding:1.2rem 2rem 6rem;
+}
+
+/* Preserve normal vertical scrolling in Streamlit's main content area. */
+[data-testid='stMain'] {
+  overflow-y:auto !important;
+  overflow-x:hidden !important;
+}
+
+[data-testid='stMainBlockContainer'] {
+  min-height:max-content !important;
 }
 
 
