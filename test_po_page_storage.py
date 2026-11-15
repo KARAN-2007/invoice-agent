@@ -5,16 +5,18 @@ import types
 # Streamlit is only needed when rendering UI; these tests exercise pure helpers.
 sys.modules.setdefault("streamlit", types.ModuleType("streamlit"))
 
-from po_pages import get_next_po_id, merge_saved_purchase_orders
+from po_pages import get_next_po_id, merge_saved_purchase_orders, parse_positive_number
 
 
-def test_next_po_id_continues_after_reference_dataset():
+def test_next_po_id_continues_after_reference_dataset(tmp_path):
     records = [
         {"po_number": "PO-101"},
         {"po_number": "PO-118"},
         {"po_number": "PO-103"},
     ]
-    assert get_next_po_id(records) == 119
+    # Use an isolated empty data directory so local POs created during UI
+    # testing do not change this fixture-based expectation.
+    assert get_next_po_id(records, base_dir=tmp_path) == 119
 
 
 def test_next_po_id_uses_explicit_po_id_before_po_number(tmp_path):
@@ -67,3 +69,16 @@ def test_merge_saved_po_adds_new_record(tmp_path):
     )
     merged = merge_saved_purchase_orders({"purchase_orders": []}, base_dir=tmp_path)
     assert merged["purchase_orders"][0]["record_id"] == "po_119"
+
+
+def test_po_form_accepts_blank_first_then_parses_positive_values():
+    assert parse_positive_number("2", "Quantity", 1) == 2.0
+    assert parse_positive_number("1,200.50", "Unit price", 1) == 1200.5
+
+
+def test_po_form_rejects_missing_or_non_positive_values():
+    import pytest
+
+    for value in ("", "0", "-2", "not a number", "nan", "inf"):
+        with pytest.raises(ValueError):
+            parse_positive_number(value, "Quantity", 1)

@@ -1,4 +1,3 @@
-
 """Purchase-order management with PO-based JSON record persistence.
 
 Canonical saved PO path: data/purchase_orders/po_<po_id>.json
@@ -7,6 +6,7 @@ saved separately and merged into this page for subsequent viewing.
 """
 
 import json
+import math
 from pathlib import Path
 
 import streamlit as st
@@ -163,6 +163,24 @@ def format_amount(value, currency="INR"):
         return "Not specified"
 
 
+def parse_positive_number(value, field_name, item_number):
+    """Parse a required positive number from a blank text input."""
+    raw = str(value or "").strip().replace(",", "")
+    if not raw:
+        raise ValueError(f"Enter {field_name.lower()} for item {item_number}.")
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{field_name} for item {item_number} must be a valid number."
+        ) from None
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(
+            f"{field_name} for item {item_number} must be greater than zero."
+        )
+    return number
+
+
 def get_vendor_options(reference):
     vendors = reference.get("vendors", [])
     names = set()
@@ -195,14 +213,9 @@ def get_vendor_id(reference, vendor_name):
             if str(name or "").strip() == str(vendor_name or "").strip():
                 return vendor.get("vendor_id") or vendor.get("id")
 
-    purchase_orders = reference.get("purchase_orders", [])
-    if isinstance(purchase_orders, list):
-        for po in purchase_orders:
-            if (
-                isinstance(po, dict)
-                and str(get_po_vendor(po)).strip() == str(vendor_name).strip()
-            ):
-                return po.get("vendor_id")
+    for po in reference.get("purchase_orders", []) if isinstance(reference.get("purchase_orders"), list) else []:
+        if isinstance(po, dict) and str(get_po_vendor(po)).strip() == str(vendor_name).strip():
+            return po.get("vendor_id")
 
     return None
 
@@ -273,7 +286,7 @@ def render_po_details(po):
             "Description": item.get("description") or "-",
             "Quantity ordered": item.get("quantity_ordered", "-"),
             "Approved unit price": format_amount(item.get("approved_unit_price"), currency),
-            "Tax rate": str(item.get("tax_percent")) + "%" if item.get("tax_percent") is not None else "-",
+            "Tax rate": str(item.get("tax_percent")) + "%" if item.get("tax_percent") is not None else "Not specified",
         })
 
     st.dataframe(
@@ -446,43 +459,42 @@ def render_create_po(reference, user=None):
 
         st.divider()
         st.markdown("#### 2. Purchase order items")
+        st.caption(
+            "Enter the agreed unit price from the vendor quotation. Quantity and price "
+            "start blank, so you do not need to clear default numbers."
+        )
+        st.info(
+            "Tax is not guessed or manually set here. It should come from the approved "
+            "vendor quotation or the item's tax/HSN master data. Until that data is "
+            "connected, this PO stores a pre-tax subtotal and GST-rate matching is not "
+            "available for this newly created PO."
+        )
         draft_items = []
 
         for index in range(int(item_count)):
             st.markdown(f"**Item {index + 1}**")
-            description = st.text_input("Item description", key=f"po_item_description_{index}")
-            col1, col2, col3 = st.columns(3)
+            description = st.text_input(
+                "Item description",
+                key=f"po_item_description_{index}",
+            )
+            col1, col2 = st.columns(2)
             with col1:
-                quantity = st.number_input(
+                quantity_input = st.text_input(
                     "Quantity",
-                    min_value=0.0,
-                    value=1.0,
-                    step=1.0,
-                    key=f"po_item_quantity_{index}",
+                    placeholder="Enter quantity",
+                    key=f"po_item_quantity_text_{index}",
                 )
             with col2:
-                unit_price = st.number_input(
+                unit_price_input = st.text_input(
                     "Unit price",
-                    min_value=0.0,
-                    value=0.0,
-                    step=100.0,
-                    key=f"po_item_price_{index}",
-                )
-            with col3:
-                tax_percent = st.number_input(
-                    "Tax (%)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=18.0,
-                    step=0.5,
-                    key=f"po_item_tax_{index}",
+                    placeholder="Enter agreed unit price",
+                    key=f"po_item_price_text_{index}",
                 )
 
             draft_items.append({
                 "description": description.strip(),
-                "quantity_ordered": quantity,
-                "approved_unit_price": unit_price,
-                "tax_percent": tax_percent,
+                "quantity_input": quantity_input,
+                "unit_price_input": unit_price_input,
             })
             st.divider()
 
@@ -493,43 +505,51 @@ def render_create_po(reference, user=None):
         )
 
     if submitted:
+        # Remove an older preview before validating the newly submitted form.
+        st.session_state.pop("po_draft_preview", None)
         vendor_name = str(vendor_name or "").strip()
         if not vendor_name:
             st.error("Please provide a vendor name.")
-        elif any(
-            not item["description"]
-            or item["quantity_ordered"] <= 0
-            or item["approved_unit_price"] <= 0
-            for item in draft_items
-        ):
-            st.error(
-                "Every item needs a description, positive quantity "
-                "and positive unit price."
-            )
         else:
-            subtotal = sum(
-                item["quantity_ordered"] * item["approved_unit_price"]
-                for item in draft_items
-            )
-            tax_total = sum(
-                item["quantity_ordered"]
-                * item["approved_unit_price"]
-                * item["tax_percent"] / 100
-                for item in draft_items
-            )
-            po_id = get_next_po_id(reference.get("purchase_orders", []))
-            st.session_state["po_draft_preview"] = {
-                "po_id": po_id,
-                "po_number": f"PO-{po_id}",
-                "vendor": vendor_name,
-                "vendor_id": get_vendor_id(reference, vendor_name),
-                "currency": currency,
-                "tolerance": tolerance,
-                "items": draft_items,
-                "subtotal": subtotal,
-                "tax": tax_total,
-                "total": subtotal + tax_total,
-            }
+            try:
+                normalized_items = []
+                for item_number, item in enumerate(draft_items, start=1):
+                    description = item["description"]
+                    if not description:
+                        raise ValueError(
+                            f"Enter an item description for item {item_number}."
+                        )
+                    quantity = parse_positive_number(
+                        item["quantity_input"], "Quantity", item_number
+                    )
+                    unit_price = parse_positive_number(
+                        item["unit_price_input"], "Unit price", item_number
+                    )
+                    normalized_items.append({
+                        "description": description,
+                        "quantity_ordered": quantity,
+                        "approved_unit_price": unit_price,
+                    })
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                subtotal = sum(
+                    item["quantity_ordered"] * item["approved_unit_price"]
+                    for item in normalized_items
+                )
+                po_id = get_next_po_id(reference.get("purchase_orders", []))
+                st.session_state["po_draft_preview"] = {
+                    "po_id": po_id,
+                    "po_number": f"PO-{po_id}",
+                    "vendor": vendor_name,
+                    "vendor_id": get_vendor_id(reference, vendor_name),
+                    "currency": currency,
+                    "tolerance": tolerance,
+                    "items": normalized_items,
+                    "subtotal": subtotal,
+                    "tax": None,
+                    "total": subtotal,
+                }
 
     draft = st.session_state.get("po_draft_preview")
     if draft:
@@ -555,7 +575,7 @@ def render_create_po(reference, user=None):
                 "Description": item["description"],
                 "Quantity": item["quantity_ordered"],
                 "Unit price": format_amount(item["approved_unit_price"], draft["currency"]),
-                "Tax": str(item["tax_percent"]) + "%",
+                "Tax": "Not specified",
             })
         st.dataframe(
             preview_rows,
@@ -565,9 +585,9 @@ def render_create_po(reference, user=None):
         )
 
         st.markdown("**Financial summary**")
-        st.write("Line subtotal before tax: " + format_amount(draft["subtotal"], draft["currency"]))
-        st.write("Calculated tax: " + format_amount(draft["tax"], draft["currency"]))
-        st.subheader("Preview total: " + format_amount(draft["total"], draft["currency"]))
+        st.write("PO subtotal before tax: " + format_amount(draft["subtotal"], draft["currency"]))
+        st.write("Tax: Not specified — use the approved quotation or item tax master.")
+        st.subheader("PO subtotal (tax not included): " + format_amount(draft["total"], draft["currency"]))
 
         save_col, clear_col = st.columns(2)
         if save_col.button(
@@ -599,8 +619,11 @@ def render_create_po(reference, user=None):
                         "status": "PENDING",
                         "items": draft["items"],
                         "subtotal": float(draft["subtotal"]),
-                        "tax": float(draft["tax"]),
+                        "tax": None,
+                        "tax_status": "NOT_SPECIFIED",
                         "total_amount": float(draft["total"]),
+                        "total_amount_includes_tax": False,
+                        "total_amount_basis": "PRE_TAX_SUBTOTAL",
                         "created_by": (user or {}).get("username"),
                     }
                     saved_path = save_purchase_order(draft["po_id"], po_record)
