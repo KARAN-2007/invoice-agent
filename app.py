@@ -1237,6 +1237,102 @@ def _render_payment_schedule_tab(user):
             hide_index=True,
         )
 
+@st.dialog("Confirm decision", width="small")
+def _confirm_decision_dialog(
+    request_id,
+    decision,
+    file_name,
+    username,
+    user_role,
+    note,
+):
+    """Modal confirmation for approve/reject actions."""
+
+    action_verb = "approve" if decision == "APPROVED" else "reject"
+    action_title = "Approve" if decision == "APPROVED" else "Reject"
+
+    st.markdown(f"### {action_title} request #{request_id}?")
+
+    st.write(f"**File:** `{file_name}`")
+
+    if note:
+        st.caption(f"Your note: {note}")
+
+    if decision == "APPROVED":
+        st.info(
+            "Approving this stage advances the invoice to the next "
+            "approval stage. If this is the final stage, the invoice "
+            "is fully approved and a payment schedule is created."
+        )
+    else:
+        st.warning(
+            "Rejecting ends the approval workflow for this invoice. "
+            "This cannot be undone."
+        )
+
+    st.divider()
+    confirm_col, cancel_col = st.columns(2)
+
+    if confirm_col.button(
+        f"Yes, {action_verb}",
+        type="primary",
+        use_container_width=True,
+        key=f"confirm_{decision}_{request_id}",
+    ):
+        try:
+            outcome = decide_approval_stage(
+                request_id, decision, username, user_role, note
+            )
+
+            if outcome["request_status"] == "APPROVED":
+                message = (
+                    "Invoice fully approved after all three stages: "
+                    + str(file_name)
+                )
+                try:
+                    _auto_create_payment_schedule(
+                        approval_request_id=request_id,
+                        invoice_number=file_name,
+                    )
+                except Exception as pay_exc:
+                    message += (
+                        " WARNING: payment schedule could not be created: "
+                        + str(pay_exc)[:120]
+                    )
+            elif outcome["request_status"] == "REJECTED":
+                message = (
+                    "Invoice rejected at "
+                    + str(outcome["stage"]) + ": " + str(file_name)
+                )
+            else:
+                message = (
+                    str(outcome["stage"]) + " approved. Next stage: "
+                    + str(outcome["next_stage"]) + "."
+                )
+
+            if not outcome.get("audit_recorded"):
+                message += (
+                    " WARNING: the decision was saved, but its audit "
+                    "event could not be written."
+                )
+
+            st.session_state["message"] = message
+
+        except Exception as exc:
+            st.session_state["message"] = (
+                "Could not save the decision. " + str(exc)[:200]
+            )
+
+        st.session_state.pop("pending_decision", None)
+        st.rerun()
+
+    if cancel_col.button(
+        "Cancel",
+        use_container_width=True,
+        key=f"cancel_{decision}_{request_id}",
+    ):
+        st.session_state.pop("pending_decision", None)
+        st.rerun()
 
 def approvals_page(user):
     allowed_roles = ["department_head", "finance_officer", "final_approver", "approver", "admin"]
@@ -1250,7 +1346,14 @@ def approvals_page(user):
 
     if "message" in st.session_state:
         st.success(st.session_state.pop("message"))
-
+    
+    # If a decision was queued in a previous interaction, open the
+    # confirmation modal. This runs before the rest of the page renders.
+    
+    pending = st.session_state.get("pending_decision")
+    if pending:
+        _confirm_decision_dialog(**pending)
+    
     try:
         all_pending = list_approval_requests("PENDING")
         decided = [row for row in list_approval_requests() if row["status"] != "PENDING"]
@@ -1374,52 +1477,38 @@ def approvals_page(user):
                     placeholder="Explain your decision or note any follow-up needed...",
                 )
                 action_left, action_right, _ = st.columns([1, 1, 2])
-                decision = None
-                if action_left.button("Approve this stage", type="primary", key="approve_stage_" + request_id + "_" + user_role, use_container_width=True):
-                    decision = "APPROVED"
-                if action_right.button("Reject invoice", type="secondary", key="reject_stage_" + request_id + "_" + user_role, use_container_width=True):
-                    decision = "REJECTED"
 
-                if decision:
-                    try:
-                        outcome = decide_approval_stage(
-                            req["id"], decision, user["username"], user_role, note
-                        )
-                        if outcome["request_status"] == "APPROVED":
-                            message = "Invoice fully approved after all three stages: " + str(file_name)
-
-                            # ── PAYMENT HOOK ──
-                            # The workflow reached its final stage and approved.
-                            # Create the payment schedule now. Idempotent: if
-                            # decide_approval_stage already did this, the
-                            # ON CONFLICT clause means nothing extra happens.
-                            try:
-                                _auto_create_payment_schedule(
-                                    approval_request_id=req["id"],
-                                    invoice_number=file_name,
-                                )
-                            except Exception as pay_exc:
-                                # Never let a payment-schedule failure undo
-                                # an approval that the approver just made.
-                                message += (
-                                    " WARNING: payment schedule could not be created: "
-                                    + str(pay_exc)[:120]
-                                )
-
-                        elif outcome["request_status"] == "REJECTED":
-                            message = "Invoice rejected at " + str(outcome["stage"]) + ": " + str(file_name)
-                        else:
-                            message = (
-                                str(outcome["stage"]) + " approved. Next stage: "
-                                + str(outcome["next_stage"]) + "."
-                            )
-                        if not outcome.get("audit_recorded"):
-                            message += " WARNING: the decision was saved, but its audit event could not be written."
-                        st.session_state["message"] = message
-                    except Exception as exc:
-                        st.error("Could not save the stage decision.")
-                        st.caption(str(exc)[:200])
+                if action_left.button(
+                    "Approve this stage",
+                    type="primary",
+                    key="approve_stage_" + request_id + "_" + user_role,
+                    use_container_width=True,
+                ):
+                    st.session_state["pending_decision"] = {
+                        "request_id": req["id"],
+                        "decision": "APPROVED",
+                        "file_name": file_name,
+                        "username": user["username"],
+                        "user_role": user_role,
+                        "note": note,
+                    }
                     st.rerun()
+
+                if action_right.button(
+                    "Reject invoice",
+                    type="secondary",
+                    key="reject_stage_" + request_id + "_" + user_role,
+                    use_container_width=True,
+                ):
+                    st.session_state["pending_decision"] = {
+                        "request_id": req["id"],
+                        "decision": "REJECTED",
+                        "file_name": file_name,
+                        "username": user["username"],
+                        "user_role": user_role,
+                        "note": note,
+                    }
+                    st.rerun()                
 
     with history_tab:
         st.subheader("Completed approval workflows")
