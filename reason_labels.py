@@ -11,6 +11,10 @@ REASONS = {
         "high",
         "This invoice number was already submitted by this vendor.",
     ),
+    "BUDGET_EXCEEDED": (
+        "Budget exceeded",
+        "high",
+        "The invoice total would push the department over its allocated budget."),
 
     "CANCELLED_PO": (
         "PO cancelled",

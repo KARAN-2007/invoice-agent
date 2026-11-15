@@ -91,6 +91,13 @@ def _invoice_po_reference(data):
 
     return str(value).strip() if value else None
 
+def _to_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 def _normalize_po(value):
     return re.sub(
@@ -467,6 +474,201 @@ def lookup_po(file_name: str, po_number: str) -> dict:
 
     return _store_cached(key, result)
 
+def _find_department(department_id, reference_data):
+    """Return a department record from reference data, or None."""
+    target = _normalize_po(department_id)
+    if not target:
+        return None
+    for dept in reference_data.get("departments", []):
+        if _normalize_po(dept.get("department_id")) == target:
+            return dept
+    return None
+
+
+def check_department_budget(file_name: str) -> dict:
+    """
+    Check whether the invoice's total fits within the remaining budget
+    of the department that owns the matching purchase order.
+
+    Returns a dict with:
+        budget_ok: True | False | None (None = could not check)
+        department_id, department_name
+        budget_allocated, budget_consumed, budget_remaining
+        invoice_total, projected_consumed
+        shortfall
+        note
+    """
+
+    file_name = str(file_name)
+
+    key = _cache_key("check_department_budget", file_name)
+    cached = _get_cached(key)
+
+    if cached is not _CACHE_MISS:
+        return cached
+
+    # 1. Load the invoice.
+    data = _load_invoice(file_name)
+
+    if not isinstance(data, dict):
+        result = {
+            "budget_ok": None,
+            "note": "Invoice could not be read; budget check was not performed.",
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    # 2. Get the invoice total.
+    invoice_total = _to_float(
+        _first_value(data, "total_amount", "total", "grand_total")
+    )
+
+    if invoice_total is None:
+        result = {
+            "budget_ok": None,
+            "note": "Invoice total is missing or unreadable; budget check skipped.",
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    # 3. Find the PO for this invoice.
+    po_reference = _invoice_po_reference(data)
+
+    if not po_reference:
+        result = {
+            "budget_ok": None,
+            "invoice_total": invoice_total,
+            "note": "Invoice has no PO reference; department cannot be determined.",
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    po_result = find_po(po_reference)
+
+    if po_result.get("status") != "found":
+        result = {
+            "budget_ok": None,
+            "invoice_total": invoice_total,
+            "po_reference": po_reference,
+            "note": (
+                "PO '" + po_reference + "' could not be found in reference data; "
+                "department budget cannot be determined."
+            ),
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    po = po_result["po"]
+    department_id = po.get("department_id")
+
+    if not department_id:
+        result = {
+            "budget_ok": None,
+            "invoice_total": invoice_total,
+            "po_reference": po_reference,
+            "note": "Purchase order has no department_id; budget check skipped.",
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    # 4. Look up the department.
+    reference_data = load_reference_data()
+    department = _find_department(department_id, reference_data)
+
+    if not department:
+        result = {
+            "budget_ok": None,
+            "department_id": department_id,
+            "invoice_total": invoice_total,
+            "note": (
+                "Department '" + str(department_id) + "' is not in the budget reference data."
+            ),
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    # 5. Compute the check.
+    allocated = _to_float(department.get("budget_allocated"))
+    consumed = _to_float(department.get("budget_consumed")) or 0.0
+
+    if allocated is None:
+        result = {
+            "budget_ok": None,
+            "department_id": department_id,
+            "invoice_total": invoice_total,
+            "note": "Department has no valid budget_allocated value.",
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return result
+
+    remaining = allocated - consumed
+    projected = consumed + invoice_total
+    shortfall = max(0.0, projected - allocated)
+    budget_ok = projected <= allocated + 0.01
+
+    if budget_ok:
+        note = (
+            "Invoice of "
+            + f"{invoice_total:,.2f}"
+            + " fits within the remaining budget of "
+            + f"{remaining:,.2f}"
+            + " for "
+            + str(department.get("name") or department_id)
+            + "."
+        )
+    else:
+        note = (
+            "Invoice of "
+            + f"{invoice_total:,.2f}"
+            + " exceeds the remaining budget of "
+            + f"{remaining:,.2f}"
+            + " by "
+            + f"{shortfall:,.2f}"
+            + " for "
+            + str(department.get("name") or department_id)
+            + "."
+        )
+
+    result = {
+        "budget_ok": budget_ok,
+        "department_id": department_id,
+        "department_name": department.get("name"),
+        "budget_allocated": allocated,
+        "budget_consumed": consumed,
+        "budget_remaining": remaining,
+        "invoice_total": invoice_total,
+        "projected_consumed": projected,
+        "shortfall": shortfall,
+        "note": note,
+    }
+
+    log_step(
+        "tool:check_department_budget",
+        {"file": file_name, "result": result},
+    )
+
+    return _store_cached(key, result)
 
 def check_vendor_matches_po(
     file_name: str,

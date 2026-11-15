@@ -17,6 +17,20 @@ from agent_tools import (
     send_to_human_review,
     start_run,
 )
+
+from agent_tools import (
+    check_dataset_rules,
+    check_department_budget,          # ← add
+    check_invoice_math,
+    check_vendor_matches_po,
+    get_dataset_result,
+    log_step,
+    lookup_po,
+    read_invoice,
+    send_to_human_review,
+    start_run,
+)
+
 from db_store import save_approval_request
 from rules import INFO_ONLY_CODES
 
@@ -97,6 +111,11 @@ Work through these steps in order:
 4. If lookup_po finds the PO exactly, call check_vendor_matches_po with the current file_name and the PO number.
 5. Always call check_dataset_rules exactly once.
 6. Treat the recommendation and findings from check_dataset_rules as authoritative.
+6a. Call check_department_budget with the exact invoice filename.
+
+    If the invoice total exceeds the remaining budget of the
+    department that owns the matching purchase order, note this
+    finding. Do not invent a budget or a department.
 7. If the dataset recommendation is NEEDS_HUMAN_REVIEW, report all returned reason codes.
 8. Do not approve, reject, pay, or route the invoice yourself. The Python program applies the final human-review routing after the checks are complete.
 9. If the only finding is PRICE_VARIANCE_WITHIN_TOLERANCE, do not describe it as a blocking issue.
@@ -106,6 +125,7 @@ Rules:
 - Never replace the deterministic dataset recommendation with your own judgement.
 - You cannot approve or pay anything. A human always makes the final approval decision.
 - Call each tool at most once, unless it returned an error.
+- Always call check_department_budget once, even if the PO was not found.
 - Finish with a short summary. The final program will determine the recommendation from the dataset rules.
 """
 
@@ -372,7 +392,9 @@ def run_agent(file_name):
                 check_invoice_math,
                 lookup_po,
                 check_vendor_matches_po,
+                check_department_budget,          # ← add
                 check_dataset_rules,
+                send_to_human_review,
             ],
         )
     except Exception as exc:

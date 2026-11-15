@@ -36,6 +36,40 @@
     }
   },
   {
+    "case_id": "INV-BUDGET-FIT",
+    "document": {
+      "invoice_number": "INV-BFIT-001",
+      "invoice_date": "2026-01-20",
+      "vendor": "Acme Traders",
+      "vendor_id": "VEN-001",
+      "po_number": "PO-2026-101",
+      "currency": "INR",
+      "items": [
+        {"sku": "PAPER-A4", "description": "Printer paper", "quantity": 100, "unit_price": 120.00, "line_total": 12000.00}
+      ],
+      "subtotal": 12000.00,
+      "tax": 2160.00,
+      "total": 14160.00
+    }
+  },
+  {
+    "case_id": "INV-BUDGET-EXCEEDED",
+    "document": {
+      "invoice_number": "INV-BEXC-001",
+      "invoice_date": "2026-01-20",
+      "vendor": "Acme Traders",
+      "vendor_id": "VEN-001",
+      "po_number": "PO-2026-101",
+      "currency": "INR",
+      "items": [
+        {"sku": "PAPER-A4", "description": "Printer paper", "quantity": 2000, "unit_price": 120.00, "line_total": 240000.00}
+      ],
+      "subtotal": 240000.00,
+      "tax": 43200.00,
+      "total": 283200.00
+    }
+  },
+  {
     "case_id": "02_unmapped_po_reference",
     "document": {
       "document_type": "COMMERCIAL_INVOICE",
@@ -457,6 +491,60 @@
       ],
       "total": null,
       "currency": "INR"
+    }
+  },
+  {
+    "case_id": "INV-BUDGET-FIT",
+    "document": {
+      "invoice_number": "INV-BFIT-001",
+      "invoice_date": "2026-01-20",
+      "vendor": "Acme Traders",
+      "vendor_id": "VEN-001",
+      "vendor_gstin": "27ABCDE1234F1Z5",
+      "po_reference": "PO-119",
+      "po_number": "PO-119",
+      "currency": "INR",
+      "items": [
+        {
+          "sku": "PAPER-A4",
+          "description": "Printer paper",
+          "quantity": 100,
+          "unit_price": 120.00,
+          "line_total": 12000.00
+        }
+      ],
+      "subtotal": 12000.00,
+      "cgst": 1080.00,
+      "sgst": 1080.00,
+      "igst": null,
+      "total": 14160.00
+    }
+  },
+  {
+    "case_id": "INV-BUDGET-EXCEEDED",
+    "document": {
+      "invoice_number": "INV-BEXC-001",
+      "invoice_date": "2026-01-20",
+      "vendor": "Acme Traders",
+      "vendor_id": "VEN-001",
+      "vendor_gstin": "27ABCDE1234F1Z5",
+      "po_reference": "PO-120",
+      "po_number": "PO-120",
+      "currency": "INR",
+      "items": [
+        {
+          "sku": "PAPER-A4",
+          "description": "Printer paper",
+          "quantity": 2000,
+          "unit_price": 120.00,
+          "line_total": 240000.00
+        }
+      ],
+      "subtotal": 240000.00,
+      "cgst": 21600.00,
+      "sgst": 21600.00,
+      "igst": null,
+      "total": 283200.00
     }
   }
 ]

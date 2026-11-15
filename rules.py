@@ -1549,6 +1549,38 @@ def _check_fx_rate(
 
     return False
 
+def _check_department_budget(
+    document: dict[str, Any],
+    reference: dict[str, Any],
+    po: dict[str, Any] | None,
+) -> bool:
+    """Return True when the invoice total exceeds the department's remaining budget."""
+    if not po:
+        return False
+
+    department_id = po.get("department_id")
+    if not department_id:
+        return False
+
+    target = _norm(department_id)
+    department = None
+    for dept in reference.get("departments", []):
+        if _norm(dept.get("department_id")) == target:
+            department = dept
+            break
+
+    if not department:
+        return False
+
+    allocated = _decimal(department.get("budget_allocated"))
+    consumed = _decimal(department.get("budget_consumed")) or Decimal("0")
+    invoice_total = _invoice_total(document)
+
+    if allocated is None or invoice_total is None:
+        return False
+
+    projected = consumed + invoice_total
+    return projected > allocated + Decimal("0.01")
 
 # ==================================================
 # HISTORY RECORD CREATION
@@ -1866,6 +1898,12 @@ def evaluate_invoice(
         reference,
     ):
         add("FX_RATE_MISMATCH")
+
+
+    if _check_department_budget(document, reference, po):
+        add("BUDGET_EXCEEDED")
+
+    
 
     return _result(
         invoice_record,

@@ -2,6 +2,33 @@
   "dataset_name": "University Accounts Payable Demo Procurement Records",
   "dataset_version": "1.0",
   "synthetic_data": true,
+  "departments": [
+    {
+      "department_id": "DEPT-IT",
+      "name": "Information Technology",
+      "budget_allocated": 500000.00,
+      "budget_consumed": 320000.00
+    },
+    {
+      "department_id": "DEPT-FAC",
+      "name": "Facilities",
+      "budget_allocated": 250000.00,
+      "budget_consumed": 180000.00
+    },
+    {
+      "department_id": "DEPT-LIB",
+      "name": "Library",
+      "budget_allocated": 150000.00,
+      "budget_consumed": 60000.00
+    },
+    {
+      "department_id": "DEPT-EXAM",
+      "name": "Examinations",
+      "budget_allocated": 100000.00,
+      "budget_consumed": 95000.00
+    }
+    
+  ],
   "vendors": [
     {
       "vendor_id": "VEN-101",
@@ -356,7 +383,42 @@
           "tax_percent": 18
         }
       ]
+    },
+    {
+      "po_number": "PO-119",
+      "vendor_id": "VEN-001",
+      "vendor_name": "Acme Traders",
+      "department_id": "DEPT-IT",
+      "total_amount": 300000.00,
+      "status": "APPROVED",
+      "price_tolerance_percent": 2.0,
+      "items": [
+        {
+          "sku": "PAPER-A4",
+          "description": "Printer paper",
+          "quantity_ordered": 2500,
+          "approved_unit_price": 120.00
+        } 
+      ]
+    },
+    {
+      "po_number": "PO-120",
+      "vendor_id": "VEN-001",
+      "vendor_name": "Acme Traders",
+      "department_id": "DEPT-IT",
+      "total_amount": 300000.00,
+      "status": "APPROVED",
+      "price_tolerance_percent": 2.0,
+      "items": [
+        {
+          "sku": "PAPER-A4",
+          "description": "Printer paper",
+          "quantity_ordered": 2500,
+          "approved_unit_price": 120.00
+        }
+      ]
     }
+
   ],
   "goods_receipts": [
     {
@@ -511,6 +573,22 @@
           "quantity_accepted": 10
         }
       ]
+    },
+    {
+      "po_number": "PO-119",
+      "status": "ACCEPTED",
+      "received_at": "2026-01-18",
+      "items": [
+        { "sku": "PAPER-A4", "description": "Printer paper", "quantity_accepted": 2500 }
+      ]
+    },
+    {
+      "po_number": "PO-120",
+      "status": "ACCEPTED",
+      "received_at": "2026-01-18",
+      "items": [
+      { "sku": "PAPER-A4", "description": "Printer paper", "quantity_accepted": 2500 }
+      ]
     }
   ],
   "service_confirmations": [
@@ -632,4 +710,5 @@
       "note": "Duplicate detection should not rely on filename alone."
     }
   }
+
 }

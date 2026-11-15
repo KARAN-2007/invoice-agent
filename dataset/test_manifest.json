@@ -1,5 +1,18 @@
 [
   {
+    "case_id": "INV-BUDGET-FIT",
+    "sequence": 19,
+    "expected_recommendation": "READY_FOR_APPROVAL",
+    "expected_findings": []
+  },
+  {
+    "case_id": "INV-BUDGET-EXCEEDED",
+    "sequence": 20,
+    "expected_recommendation": "NEEDS_HUMAN_REVIEW",
+    "expected_findings": ["BUDGET_EXCEEDED"]
+  },
+  
+  {
     "case_id": "01_normal_gst_invoice",
     "sequence": 1,
     "expected_recommendation": "READY_FOR_APPROVAL",
