@@ -55,4 +55,10 @@ CREATE TABLE IF NOT EXISTS payment_schedules (
 CREATE INDEX IF NOT EXISTS payment_schedules_status_date_idx
     ON payment_schedules (payment_status, scheduled_payment_date);
 
+-- Vendor-facing clarification message. NULL means no vendor action needed.
+ALTER TABLE approval_requests
+    ADD COLUMN IF NOT EXISTS vendor_message TEXT;
 
+-- Index so the vendor page can quickly fetch "my" submissions.
+CREATE INDEX IF NOT EXISTS approval_requests_file_name_idx
+    ON approval_requests (file_name);

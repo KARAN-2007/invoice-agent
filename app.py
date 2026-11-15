@@ -38,6 +38,8 @@ from db_store import (
     _auto_create_payment_schedule,
     cancel_payment,                   # ← add
     decide_request,
+    list_vendor_submissions,          # ← add
+    acknowledge_vendor_message,       # ← add
     list_approval_requests,
     list_payment_schedules,           # ← add
     mark_payment_paid,                # ← add
@@ -765,12 +767,209 @@ def login_screen():
 # ==================================================
 # VENDOR UPLOAD PAGE
 # ==================================================
+def _render_vendor_submissions(user):
+    """Show this vendor's previous uploads, with discrepancy messages."""
+
+    st.subheader("Your submissions")
+
+    st.caption(
+        "Any discrepancies flagged by the verification agent appear here. "
+        "Re-upload a corrected invoice if requested."
+    )
+
+    try:
+        submissions = list_vendor_submissions(user["username"])
+    except Exception as exc:
+        st.error("Could not load your submissions.")
+        st.caption(str(exc)[:200])
+        return
+
+    if not submissions:
+        st.info("You have not submitted any invoices yet.")
+        return
+
+    for row in submissions:
+        request_id = row["id"]
+        file_name = row["file_name"]
+        status = row["status"]
+        recommendation = row["recommendation"]
+        vendor_message = row.get("vendor_message")
+
+        with st.container(border=True):
+            header_left, header_right = st.columns([3, 1])
+
+            with header_left:
+                st.markdown(f"### {file_name}")
+                st.caption(
+                    f"Submitted: {row['created_at']} · Request #{request_id}"
+                )
+
+            with header_right:
+                if status == "PENDING":
+                    st.info("Awaiting review")
+                elif status == "APPROVED":
+                    st.success("Approved")
+                elif status == "REJECTED":
+                    st.error("Rejected")
+                else:
+                    st.caption(status or "—")
+
+            # Vendor-facing message takes priority — it's the actionable bit.
+            if vendor_message:
+                st.warning(f"**Action needed:** {vendor_message}")
+
+                if st.button(
+                    "I've read this / will re-upload",
+                    key=f"ack_{request_id}",
+                ):
+                    try:
+                        if acknowledge_vendor_message(request_id):
+                            st.success("Acknowledged.")
+                            st.rerun()
+                        else:
+                            st.info("Already acknowledged.")
+                    except Exception as exc:
+                        st.error("Could not acknowledge.")
+                        st.caption(str(exc)[:200])
+
+            # Expandable details for the vendor.
+            with st.expander("What did the agent check?"):
+                if row.get("review_reason"):
+                    st.write("**Findings:**")
+                    render_reasons(row["review_reason"])
+                else:
+                    st.write("No issues recorded.")
+
+                if row.get("summary"):
+                    st.write("**Agent summary:**")
+                    st.write(row["summary"])
+
+            # Download original.
+            path = INVOICE_DIR / file_name
+            if path.exists():
+                st.download_button(
+                    "Download your original",
+                    data=path.read_bytes(),
+                    file_name=path.name,
+                    key=f"dl_{request_id}",
+                )
+                
+# ==================================================
+# VENDOR UPLOAD PAGE
+# ==================================================
 
 def upload_page(user):
+    """Vendor workspace: upload new invoice or view previous submissions."""
     require_role(user, ["vendor"])
-    st.markdown("<div class='page-eyebrow'>VENDOR WORKSPACE</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='page-eyebrow'>VENDOR WORKSPACE</div>",
+        unsafe_allow_html=True,
+    )
     st.title("Submit an invoice")
-    st.caption("Upload your invoice for automated verification. The system checks the information and sends it for human approval.")
+    st.caption(
+        "Upload your invoice for automated verification. "
+        "Any discrepancies flagged by the agent appear in 'My submissions'."
+    )
+
+    upload_tab, submissions_tab = st.tabs(
+        ["Upload invoice", "My submissions"]
+    )
+
+    with submissions_tab:
+        _render_vendor_submissions(user)
+
+    with upload_tab:
+        _render_upload_form(user)
+
+
+def _render_vendor_submissions(user):
+    """Show this vendor's previous uploads, with discrepancy messages."""
+
+    st.subheader("Your submissions")
+    st.caption(
+        "Any discrepancies flagged by the verification agent appear here. "
+        "Re-upload a corrected invoice if requested."
+    )
+
+    try:
+        submissions = list_vendor_submissions(user["username"])
+    except Exception as exc:
+        st.error("Could not load your submissions.")
+        st.caption(str(exc)[:200])
+        return
+
+    if not submissions:
+        st.info("You have not submitted any invoices yet.")
+        return
+
+    for row in submissions:
+        request_id = row["id"]
+        file_name = row["file_name"]
+        status = row["status"]
+        vendor_message = row.get("vendor_message")
+
+        with st.container(border=True):
+            header_left, header_right = st.columns([3, 1])
+
+            with header_left:
+                st.markdown(f"### {file_name}")
+                st.caption(
+                    f"Submitted: {row['created_at']} · Request #{request_id}"
+                )
+
+            with header_right:
+                if status == "PENDING":
+                    st.info("Awaiting review")
+                elif status == "APPROVED":
+                    st.success("Approved")
+                elif status == "REJECTED":
+                    st.error("Rejected")
+                else:
+                    st.caption(status or "—")
+
+            # Vendor-facing message takes priority — it's the actionable bit.
+            if vendor_message:
+                st.warning(f"**Action needed:** {vendor_message}")
+
+                if st.button(
+                    "I've read this / will re-upload",
+                    key=f"ack_{request_id}",
+                ):
+                    try:
+                        if acknowledge_vendor_message(request_id):
+                            st.success("Acknowledged.")
+                            st.rerun()
+                        else:
+                            st.info("Already acknowledged.")
+                    except Exception as exc:
+                        st.error("Could not acknowledge.")
+                        st.caption(str(exc)[:200])
+
+            # Expandable details for the vendor.
+            with st.expander("What did the agent check?"):
+                if row.get("review_reason"):
+                    st.write("**Findings:**")
+                    render_reasons(row["review_reason"])
+                else:
+                    st.write("No issues recorded.")
+
+                if row.get("summary"):
+                    st.write("**Agent summary:**")
+                    st.write(row["summary"])
+
+            # Download original.
+            path = INVOICE_DIR / file_name
+            if path.exists():
+                st.download_button(
+                    "Download your original",
+                    data=path.read_bytes(),
+                    file_name=path.name,
+                    key=f"dl_{request_id}",
+                )
+
+
+def _render_upload_form(user):
+    """Render the upload form. Called from upload_page's 'Upload invoice' tab."""
 
     file_types = [extension.lstrip(".") for extension in sorted(SUPPORTED_TYPES)]
     left, right = st.columns([1.5, 0.8], gap="large")

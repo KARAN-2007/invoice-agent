@@ -867,3 +867,170 @@ def cancel_payment(payment_id, cancelled_by):
     )
 
     return row[0]
+
+# ==================================================
+# 8. VENDOR CLARIFICATION MESSAGES
+# ==================================================
+
+def set_vendor_message(file_name, message):
+    """
+    Attach a vendor-facing clarification message to the newest
+    PENDING approval request for this invoice.
+
+    Returns the request id, or None if no pending request exists.
+    """
+
+    if not message:
+        return None
+
+    conn = get_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET vendor_message = %s
+                WHERE id = (
+                    SELECT id FROM approval_requests
+                    WHERE file_name = %s
+                      AND status = 'PENDING'
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                RETURNING id;
+                """,
+                (str(message)[:2000], file_name),
+            )
+
+            row = cur.fetchone()
+
+        conn.commit()
+
+        if row is None:
+            return None
+
+        save_log(
+            "vendor:clarification_sent",
+            {
+                "file": file_name,
+                "request_id": row[0],
+                "message": str(message)[:200],
+            },
+        )
+
+        return row[0]
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    finally:
+        conn.close()
+
+
+def list_vendor_submissions(vendor_username, limit=50):
+    """
+    Return the newest N approval requests for uploads made by this vendor.
+
+    Since approval_requests does not carry a vendor column, we match
+    on the `vendor:upload` audit event: it stores the uploader's
+    username and the resulting file_name.
+    """
+
+    conn = get_connection()
+
+    try:
+        with conn.cursor() as cur:
+            # Find file_names this vendor has uploaded.
+            cur.execute(
+                """
+                SELECT DISTINCT detail->>'file' AS file_name
+                FROM agent_log
+                WHERE step = 'vendor:upload'
+                  AND detail->>'user' = %s
+                  AND detail->>'file' IS NOT NULL;
+                """,
+                (vendor_username,),
+            )
+            filenames = [row[0] for row in cur.fetchall() if row[0]]
+
+            if not filenames:
+                return []
+
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    file_name,
+                    recommendation,
+                    summary,
+                    review_reason,
+                    vendor_message,
+                    status,
+                    created_at,
+                    decided_by,
+                    decided_at,
+                    decision_note
+                FROM approval_requests
+                WHERE file_name = ANY(%s)
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s;
+                """,
+                (filenames, limit),
+            )
+
+            columns = [
+                "id", "file_name", "recommendation", "summary",
+                "review_reason", "vendor_message", "status",
+                "created_at", "decided_by", "decided_at",
+                "decision_note",
+            ]
+
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    finally:
+        conn.close()
+
+
+def acknowledge_vendor_message(request_id):
+    """
+    Clear the vendor_message after the vendor has acknowledged it.
+
+    Leaves the approval request unchanged otherwise.
+    Returns True if a row was updated.
+    """
+
+    conn = get_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET vendor_message = NULL
+                WHERE id = %s
+                  AND vendor_message IS NOT NULL
+                RETURNING id;
+                """,
+                (request_id,),
+            )
+
+            row = cur.fetchone()
+
+        conn.commit()
+
+        return row is not None
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    finally:
+        conn.close()

@@ -2,6 +2,7 @@ import os
 import sys
 import time
 
+from db_store import save_approval_request, set_vendor_message
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -353,6 +354,19 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
             {"file": file_name, "error": str(exc)[:200]},
         )
 
+    # If a human review was triggered, write a vendor-facing message so
+    # the vendor sees the discrepancy on their next login.
+    if request_id is not None and recommendation == "NEEDS_HUMAN_REVIEW":
+        try:
+            vendor_message = _build_vendor_message(reason_codes)
+            if vendor_message:
+                set_vendor_message(file_name, vendor_message)
+        except Exception as exc:
+            _safe_log(
+                "agent:vendor_message_error",
+                {"file": file_name, "error": str(exc)[:200]},
+            )
+
     _safe_log(
         "agent:recorded",
         {
@@ -371,6 +385,70 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
         "findings": reason_codes,
     }
 
+# Vendor-facing message templates keyed by reason code.
+# Only codes that a vendor can meaningfully act on are included.
+_VENDOR_MESSAGE_TEMPLATES = {
+    "MISSING_PO_REFERENCE":
+        "Your invoice does not show a purchase order number. "
+        "Please re-upload it with the PO number clearly printed.",
+
+    "PO_REFERENCE_UNMAPPED":
+        "The purchase order reference on your invoice does not match "
+        "any PO on record. Please confirm the PO number and re-upload.",
+
+    "VENDOR_PO_MISMATCH":
+        "The vendor name or GSTIN on your invoice does not match the "
+        "vendor assigned to the purchase order. Please re-upload a "
+        "corrected invoice, or contact the procurement office.",
+
+    "VENDOR_GSTIN_MISMATCH":
+        "The GSTIN on your invoice does not match the vendor on record. "
+        "Please re-upload a corrected invoice.",
+
+    "INVOICE_ARITHMETIC_MISMATCH":
+        "The line totals or grand total on your invoice do not add up. "
+        "Please verify the amounts and re-upload a corrected invoice.",
+
+    "PO_UNIT_PRICE_MISMATCH":
+        "The unit price on your invoice differs from the approved price "
+        "on the purchase order. Please re-upload the invoice at the "
+        "approved price, or contact procurement to amend the PO.",
+
+    "GRN_QUANTITY_SHORTAGE":
+        "The quantity billed on your invoice exceeds the quantity "
+        "recorded as received. Please re-upload with the correct "
+        "quantities, or contact the receiving department.",
+
+    "MISSING_GOODS_RECEIPT":
+        "We have no goods receipt on record for this purchase order. "
+        "Please contact the receiving department before re-submitting.",
+
+    "INCOMPLETE_EXTRACTION":
+        "Some details on your invoice could not be read. Please "
+        "re-upload a clearer scan or a digital copy.",
+
+    "LOW_DOCUMENT_QUALITY":
+        "The scan quality of your invoice is too low to verify. "
+        "Please re-upload a clearer scan or a digital copy.",
+}
+
+
+def _build_vendor_message(reason_codes):
+    """Return a vendor-friendly explanation for the given findings."""
+    if not reason_codes:
+        return None
+
+    # Take the first template whose code appears in the findings.
+    # Order matters: earlier codes are more actionable than later ones.
+    for code in reason_codes:
+        if code in _VENDOR_MESSAGE_TEMPLATES:
+            return _VENDOR_MESSAGE_TEMPLATES[code]
+
+    # Fallback for codes we don't have a template for.
+    return (
+        "Your invoice was flagged for human review. "
+        "Please check the details and re-upload if anything is incorrect."
+    )
 
 # ==================================================
 # 5. MAIN AGENT
