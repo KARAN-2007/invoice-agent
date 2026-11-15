@@ -34,6 +34,7 @@ from db_store import (
     save_log,
 )
 
+
 from extract_invoice import SUPPORTED_TYPES
 from theme import inject_theme, LOGIN_HERO_HTML, LOGIN_FOOTER_HTML
 from reason_labels import render_reasons, short_reasons
@@ -41,19 +42,6 @@ from record_store import (
     RecordStoreError,
     normalize_po_id,
     save_invoice,
-)
-from db_store import (
-    _auto_create_payment_schedule,
-    cancel_payment,                   # ← add
-    decide_request,
-    list_vendor_submissions,          # ← add
-    acknowledge_vendor_message,       # ← add
-    list_approval_requests,
-    list_payment_schedules,           # ← add
-    mark_payment_paid,                # ← add
-    save_log,
-    save_approval_request,
-    has_queued_approval_request,
 )
 
 INVOICE_DIR = Path(__file__).parent / "invoices"
@@ -775,92 +763,6 @@ def login_screen():
 # ==================================================
 # VENDOR UPLOAD PAGE
 # ==================================================
-def _render_vendor_submissions(user):
-    """Show this vendor's previous uploads, with discrepancy messages."""
-
-    st.subheader("Your submissions")
-
-    st.caption(
-        "Any discrepancies flagged by the verification agent appear here. "
-        "Re-upload a corrected invoice if requested."
-    )
-
-    try:
-        submissions = list_vendor_submissions(user["username"])
-    except Exception as exc:
-        st.error("Could not load your submissions.")
-        st.caption(str(exc)[:200])
-        return
-
-    if not submissions:
-        st.info("You have not submitted any invoices yet.")
-        return
-
-    for row in submissions:
-        request_id = row["id"]
-        file_name = row["file_name"]
-        status = row["status"]
-        recommendation = row["recommendation"]
-        vendor_message = row.get("vendor_message")
-
-        with st.container(border=True):
-            header_left, header_right = st.columns([3, 1])
-
-            with header_left:
-                st.markdown(f"### {file_name}")
-                st.caption(
-                    f"Submitted: {row['created_at']} · Request #{request_id}"
-                )
-
-            with header_right:
-                if status == "PENDING":
-                    st.info("Awaiting review")
-                elif status == "APPROVED":
-                    st.success("Approved")
-                elif status == "REJECTED":
-                    st.error("Rejected")
-                else:
-                    st.caption(status or "—")
-
-            # Vendor-facing message takes priority — it's the actionable bit.
-            if vendor_message:
-                st.warning(f"**Action needed:** {vendor_message}")
-
-                if st.button(
-                    "I've read this / will re-upload",
-                    key=f"ack_{request_id}",
-                ):
-                    try:
-                        if acknowledge_vendor_message(request_id):
-                            st.success("Acknowledged.")
-                            st.rerun()
-                        else:
-                            st.info("Already acknowledged.")
-                    except Exception as exc:
-                        st.error("Could not acknowledge.")
-                        st.caption(str(exc)[:200])
-
-            # Expandable details for the vendor.
-            with st.expander("What did the agent check?"):
-                if row.get("review_reason"):
-                    st.write("**Findings:**")
-                    render_reasons(row["review_reason"])
-                else:
-                    st.write("No issues recorded.")
-
-                if row.get("summary"):
-                    st.write("**Agent summary:**")
-                    st.write(row["summary"])
-
-            # Download original.
-            path = INVOICE_DIR / file_name
-            if path.exists():
-                st.download_button(
-                    "Download your original",
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    key=f"dl_{request_id}",
-                )
                 
 # ==================================================
 # VENDOR UPLOAD PAGE
