@@ -94,7 +94,7 @@ Work through these steps in order:
 1. Call read_invoice to get the invoice data.
 2. Call check_invoice_math to check its arithmetic.
 3. If the invoice has a PO number, call lookup_po with the current file_name and the PO exactly as printed.
-4. If lookup_po finds the PO exactly, call check_vendor_matches_po with the current file_name and PO number.
+4. If lookup_po finds the PO exactly, call check_vendor_matches_po with the current file_name and the PO number.
 5. Always call check_dataset_rules exactly once.
 6. Treat the recommendation and findings from check_dataset_rules as authoritative.
 7. If the dataset recommendation is NEEDS_HUMAN_REVIEW, report all returned reason codes.
@@ -140,8 +140,18 @@ def _ensure_required_tool_checks(file_name):
         invoice_data.get("po_number")
         or invoice_data.get("po_reference")
         or invoice_data.get("purchase_order")
+        or invoice_data.get("purchase_order_reference")
+        or invoice_data.get("reference_po")
+        or invoice_data.get("purchase_reference")
         or invoice_data.get("po_no")
     )
+
+    if not po_number:
+        reference_details = invoice_data.get("reference_details")
+        if isinstance(reference_details, dict):
+            reference_type = str(reference_details.get("reference_type") or "").lower()
+            if "purchase order" in reference_type or reference_type == "po":
+                po_number = reference_details.get("customer_order")
 
     if po_number is not None and str(po_number).strip():
         po_number = str(po_number).strip().upper()
