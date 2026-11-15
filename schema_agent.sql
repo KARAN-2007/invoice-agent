@@ -62,3 +62,23 @@ ALTER TABLE approval_requests
 -- Index so the vendor page can quickly fetch "my" submissions.
 CREATE INDEX IF NOT EXISTS approval_requests_file_name_idx
     ON approval_requests (file_name);
+
+-- Expand allowed application roles for multi-level approvals.
+-- Safe to rerun; preserves existing user records.
+
+ALTER TABLE users
+    DROP CONSTRAINT IF EXISTS users_role_check;
+
+ALTER TABLE users
+    ADD CONSTRAINT users_role_check
+    CHECK (
+        role IN (
+            'vendor',
+            'procurement_officer',
+            'department_head',
+            'finance_officer',
+            'final_approver',
+            'approver',
+            'admin'
+        )
+    );

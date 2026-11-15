@@ -105,10 +105,10 @@ def create_user(username, full_name, role, password):
                 VALUES (%s, %s, %s, %s)
 
                 ON CONFLICT (username)
-                DO UPDATE SET
-                    full_name = EXCLUDED.full_name,
-                    role = EXCLUDED.role,
-                    password_hash = EXCLUDED.password_hash;
+DO UPDATE SET
+    full_name = EXCLUDED.full_name,
+    role = EXCLUDED.role,
+    password_hash = EXCLUDED.password_hash;
                 """,
                 (
                     username,
