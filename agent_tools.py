@@ -7,7 +7,11 @@ from pathlib import Path
 from checks import check_line_math, check_vendor
 from db_store import save_log
 from run_invoices import get_invoice_data
-from tools import find_po
+from tools import (
+    find_po,
+    load_saved_goods_receipts,
+    load_saved_purchase_orders,
+)
 from rules import evaluate_invoice, load_reference_data
 
 INVOICE_DIR = Path(__file__).resolve().parent / "invoices"
@@ -96,9 +100,58 @@ def _normalize_po(value):
     )
 
 
-def start_run(file_name):
-    """Clear this invoice's per-run state."""
+def _merge_saved_procurement_records(reference):
+    """Include app-created PO and GRN JSON records in deterministic checks."""
+    if not isinstance(reference, dict):
+        raise ValueError("Procurement reference data must be a dictionary.")
 
+    merged = copy.deepcopy(reference)
+    for key in ("purchase_orders", "goods_receipts"):
+        if not isinstance(merged.get(key), list):
+            merged[key] = []
+        merged[key] = [row for row in merged[key] if isinstance(row, dict)]
+
+    # A saved PO is the current record for its PO number; keep fixtures that
+    # are not replaced by a saved record.
+    for saved_po in load_saved_purchase_orders():
+        wanted = _normalize_po(saved_po.get("po_number"))
+        match_index = next(
+            (
+                index for index, row in enumerate(merged["purchase_orders"])
+                if _normalize_po(row.get("po_number")) == wanted
+            ),
+            None,
+        )
+        if match_index is None:
+            merged["purchase_orders"].append(saved_po)
+        else:
+            merged["purchase_orders"][match_index] = saved_po
+
+    # Merge GRNs by GRN number so reference data can retain multiple partial
+    # receipts for a PO while avoiding duplicate copies of the same GRN.
+    for saved_grn in load_saved_goods_receipts():
+        grn_number = _normalize_po(saved_grn.get("grn_number"))
+        match_index = None
+        if grn_number:
+            match_index = next(
+                (
+                    index for index, row in enumerate(merged["goods_receipts"])
+                    if _normalize_po(row.get("grn_number")) == grn_number
+                ),
+                None,
+            )
+        if match_index is None:
+            merged["goods_receipts"].append(saved_grn)
+        else:
+            merged["goods_receipts"][match_index] = saved_grn
+
+    return merged
+
+
+def start_run(file_name):
+    """Clear this invoice's per-run state and refresh procurement records."""
+    global _reference_data_cache
+    _reference_data_cache = None
     file_name = str(file_name)
 
     _review_reasons.pop(file_name, None)
@@ -479,7 +532,7 @@ def check_vendor_matches_po(
             "status": "cannot_check",
             "note": (
                 "The invoice PO '" + actual_po +
-                "' could not be found in procurement reference data."
+                "' could not be found in saved or reference purchase orders."
             ),
         }
 
@@ -604,7 +657,9 @@ def check_dataset_rules(file_name: str) -> dict:
 
         else:
             if _reference_data_cache is None:
-                _reference_data_cache = load_reference_data()
+                _reference_data_cache = _merge_saved_procurement_records(
+                    load_reference_data()
+                )
 
             history = [
                 dict(row)
