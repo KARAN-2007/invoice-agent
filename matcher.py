@@ -1,122 +1,524 @@
+"""Three-way invoice matching for the Streamlit app's canonical JSON records.
+
+Reads:
+    data/purchase_orders/po_<po_id>.json
+    data/goods_receipts/grn_<po_id>.json
+    data/invoices/inv_<po_id>.json
+
+Writes timestamped reports to data/audit_reports/.
+
+This module produces audit findings and recommendations only. It never approves
+or pays an invoice; final approval remains a human decision in the application.
+"""
+
+from __future__ import annotations
+
 import json
+import re
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-# Point to your folders
-PO_DIR = Path("data/purchase_orders")
-GRN_DIR = Path("data/goods_receipts")
-INV_DIR = Path("data/invoices")
-AUDIT_DIR = Path("data/audit_reports")
+BASE_DIR = Path(__file__).resolve().parent
+PO_DIR = BASE_DIR / "data" / "purchase_orders"
+GRN_DIR = BASE_DIR / "data" / "goods_receipts"
+INV_DIR = BASE_DIR / "data" / "invoices"
+AUDIT_DIR = BASE_DIR / "data" / "audit_reports"
 
-def process_orders_sequentially():
-    print("📂 Starting live order-by-order processing (with timestamped audit files)...\n")
 
-    if not INV_DIR.exists():
-        print("⚠️ Invoices folder does not exist!")
-        return
-        
-    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-    seen_invoices = set()
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
-    for inv_file in INV_DIR.glob("*.json"):
-        with open(inv_file, "r", encoding="utf-8") as f:
-            invoice_data = json.load(f)
 
-        vendor_id = invoice_data.get("vendor_id")
-        po_id = invoice_data.get("po_id")
-        invoice_number = invoice_data.get("invoice_number")
-        invoice_items = invoice_data.get("items", [])
+def _first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
 
-        # 1. CHECK IF ANY AUDIT REPORT FOR THIS INVOICE ALREADY EXISTS
-        existing_audits = list(AUDIT_DIR.glob(f"audit_{invoice_number}_*.json"))
-        if existing_audits:
-            print(f"⏩ Skipping Invoice #{invoice_number} (Audit report already exists on disk).")
-            continue
 
-        print(f"📄 Processing New Order: Invoice #{invoice_number} (PO #{po_id})")
+def _number(value: Any) -> float | None:
+    """Convert a numeric field without silently treating missing data as zero."""
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result and abs(result) != float("inf") else None
 
-        discrepancies = []
 
-        # 2. Duplicate Invoice Check
-        inv_key = (vendor_id, invoice_number)
-        if inv_key in seen_invoices:
-            discrepancies.append(("DUPLICATE_INVOICE", f"Invoice '{invoice_number}' was already submitted."))
-        else:
-            seen_invoices.add(inv_key)
+def _normalise(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
-        # 3. Fetch matching PO file on-demand
-        po_data = None
-        po_file = PO_DIR / f"po_{po_id}.json"
-        if po_file.exists():
-            with open(po_file, "r", encoding="utf-8") as pf:
-                po_data = json.load(pf)
-        else:
-            discrepancies.append(("MISSING_PO", f"Purchase Order file for PO #{po_id} is missing."))
 
-        # 4. Fetch matching GRN file on-demand
-        grn_data = None
-        grn_file = GRN_DIR / f"grn_{po_id}.json"
-        if grn_file.exists():
-            with open(grn_file, "r", encoding="utf-8") as gf:
-                grn_data = json.load(gf)
-        else:
-            discrepancies.append(("MISSING_GRN", f"Goods Receipt file for PO #{po_id} is missing."))
+def _po_key(value: Any) -> str:
+    """Convert 119, '119', '119.0', or 'PO-119' to filename key '119'."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    raw = str(value or "").strip()
+    if raw[:2].upper() == "PO":
+        raw = raw[2:].lstrip(" -_#")
+    if re.fullmatch(r"\d+\.0+", raw):
+        raw = raw.split(".", 1)[0]
+    return re.sub(r"[^A-Za-z0-9_-]", "", raw)
 
-        # 5. Header-level & Item-level Matching (if PO exists)
-        if po_data:
-            po_total = float(po_data.get("total_amount", 0))
-            inv_total = float(invoice_data.get("total_amount", 0))
 
-            if inv_total > po_total:
-                discrepancies.append(("PRICE_HIKE", f"Invoice total ({inv_total}) exceeds PO total ({po_total})."))
+def _safe_filename(value: Any) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "invoice"))
+    return cleaned.strip("._") or "invoice"
 
-            po_items_map = {item["sku"]: item for item in po_data.get("items", [])}
 
-            for inv_item in invoice_items:
-                sku = inv_item.get("sku")
-                inv_qty = inv_item.get("quantity", 0)
-                inv_price = inv_item.get("unit_price", 0)
+def _load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"⚠️ Could not read {path}: {exc}")
+        return None
+    if not isinstance(value, dict):
+        print(f"⚠️ Skipping {path}: expected a JSON object.")
+        return None
+    return value
 
-                if sku not in po_items_map:
-                    discrepancies.append(("UNKNOWN_SKU", f"Item SKU '{sku}' on invoice was not found on PO #{po_id}."))
+
+def _invoice_items(invoice: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = invoice.get("items") or invoice.get("line_items") or []
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def _po_items(po: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = po.get("items") or po.get("line_items") or []
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def _grn_items(grn: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = grn.get("items") or grn.get("line_items") or []
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def _item_description(item: dict[str, Any]) -> str:
+    return str(_first_value(item.get("description"), item.get("name"), item.get("item"), "") or "")
+
+
+def _item_sku(item: dict[str, Any]) -> str:
+    return str(_first_value(item.get("sku"), item.get("item_code"), item.get("product_id"), "") or "")
+
+
+def _item_quantity(item: dict[str, Any], kind: str) -> float | None:
+    if kind == "po":
+        value = _first_value(
+            item.get("quantity_ordered"), item.get("quantity"), item.get("qty"), item.get("count")
+        )
+    elif kind == "invoice":
+        value = _first_value(item.get("quantity"), item.get("qty"), item.get("count"))
+    elif kind == "grn_received":
+        value = _first_value(item.get("quantity_received"), item.get("received_quantity"))
+    elif kind == "grn_accepted":
+        value = _first_value(item.get("quantity_accepted"), item.get("accepted_quantity"))
+    elif kind == "grn_rejected":
+        value = _first_value(item.get("quantity_rejected"), item.get("rejected_quantity"))
+    else:
+        return None
+    return _number(value)
+
+
+def _item_unit_price(item: dict[str, Any], kind: str) -> float | None:
+    if kind == "po":
+        value = _first_value(
+            item.get("approved_unit_price"), item.get("unit_price"), item.get("price"), item.get("rate")
+        )
+    else:
+        value = _first_value(item.get("unit_price"), item.get("price"), item.get("rate"))
+    return _number(value)
+
+
+def _match_po_item(item: dict[str, Any], po_items: list[dict[str, Any]]) -> int | None:
+    """Match using SKU when both sides have it; otherwise exact normalised description."""
+    sku = _normalise(_item_sku(item))
+    if sku:
+        sku_matches = [
+            index for index, po_item in enumerate(po_items)
+            if _normalise(_item_sku(po_item)) == sku and _normalise(_item_sku(po_item))
+        ]
+        if len(sku_matches) == 1:
+            return sku_matches[0]
+        if len(sku_matches) > 1:
+            return None
+
+    description = _normalise(_item_description(item))
+    if not description:
+        return None
+    matches = [
+        index for index, po_item in enumerate(po_items)
+        if _normalise(_item_description(po_item)) == description
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _vendor_findings(invoice: dict[str, Any], po: dict[str, Any]) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    invoice_vendor_id = _first_value(invoice.get("vendor_id"), invoice.get("vid"))
+    po_vendor_id = _first_value(po.get("vendor_id"), po.get("vid"))
+    invoice_vendor = _first_value(invoice.get("vendor"), invoice.get("vendor_name"))
+    po_vendor = _first_value(po.get("vendor_name"), po.get("vendor"))
+
+    if invoice_vendor_id is not None and po_vendor_id is not None:
+        if _normalise(invoice_vendor_id) != _normalise(po_vendor_id):
+            findings.append({
+                "type": "VENDOR_ID_MISMATCH",
+                "details": f"Invoice vendor ID '{invoice_vendor_id}' does not match PO vendor ID '{po_vendor_id}'.",
+            })
+    elif invoice_vendor is not None and po_vendor is not None:
+        if _normalise(invoice_vendor) != _normalise(po_vendor):
+            findings.append({
+                "type": "VENDOR_MISMATCH",
+                "details": f"Invoice vendor '{invoice_vendor}' does not match PO vendor '{po_vendor}'.",
+            })
+    elif invoice_vendor_id is None and invoice_vendor is None:
+        findings.append({
+            "type": "INVOICE_VENDOR_MISSING",
+            "details": "The canonical invoice record does not contain a vendor ID or vendor name.",
+        })
+    elif po_vendor_id is None and po_vendor is None:
+        findings.append({
+            "type": "PO_VENDOR_MISSING",
+            "details": "The purchase order does not contain a vendor ID or vendor name.",
+        })
+
+    # If both names are present, check them independently too. In this app the
+    # invoice vendor ID may be copied from the PO during record creation.
+    if invoice_vendor is not None and po_vendor is not None:
+        if _normalise(invoice_vendor) != _normalise(po_vendor):
+            findings.append({
+                "type": "VENDOR_NAME_MISMATCH",
+                "details": f"Invoice vendor name '{invoice_vendor}' does not match PO vendor name '{po_vendor}'.",
+            })
+    return findings
+
+
+def _duplicate_invoice_keys(invoice_records: list[tuple[Path, dict[str, Any]]]) -> Counter:
+    keys: list[tuple[str, str]] = []
+    for _path, invoice in invoice_records:
+        invoice_number = _normalise(invoice.get("invoice_number") or invoice.get("inv_no"))
+        vendor = _normalise(
+            _first_value(invoice.get("vendor_id"), invoice.get("vendor"), invoice.get("vendor_name"))
+        )
+        if invoice_number:
+            keys.append((vendor, invoice_number))
+    return Counter(keys)
+
+
+def _build_report(
+    invoice_path: Path,
+    invoice: dict[str, Any],
+    po: dict[str, Any] | None,
+    grn: dict[str, Any] | None,
+    duplicate_keys: Counter,
+) -> dict[str, Any]:
+    invoice_number = _first_value(invoice.get("invoice_number"), invoice.get("inv_no"))
+    po_id = _first_value(invoice.get("po_id"), invoice.get("purchase_order_id"), invoice.get("po_number"))
+    findings: list[dict[str, str]] = []
+
+    if not invoice_number:
+        findings.append({
+            "type": "MISSING_INVOICE_NUMBER",
+            "details": "The canonical invoice record has no invoice number.",
+        })
+
+    vendor_key = _normalise(
+        _first_value(invoice.get("vendor_id"), invoice.get("vendor"), invoice.get("vendor_name"))
+    )
+    invoice_key = _normalise(invoice_number)
+    if invoice_key and duplicate_keys[(vendor_key, invoice_key)] > 1:
+        findings.append({
+            "type": "DUPLICATE_INVOICE",
+            "details": f"Invoice '{invoice_number}' appears in more than one canonical invoice record for this vendor.",
+        })
+
+    if po is None:
+        findings.append({
+            "type": "MISSING_PO",
+            "details": f"No canonical purchase order file was found for PO '{po_id}'.",
+        })
+        po_items: list[dict[str, Any]] = []
+    else:
+        po_items = _po_items(po)
+        findings.extend(_vendor_findings(invoice, po))
+        if str(po.get("status") or "").upper() == "CANCELLED":
+            findings.append({
+                "type": "PO_CANCELLED",
+                "details": f"Purchase order '{po.get('po_number') or po_id}' is cancelled.",
+            })
+        if not po_items:
+            findings.append({
+                "type": "PO_ITEMS_MISSING",
+                "details": "The purchase order has no line items available for item-level matching.",
+            })
+
+    invoice_items = _invoice_items(invoice)
+    if not invoice_items:
+        findings.append({
+            "type": "INVOICE_ITEMS_MISSING",
+            "details": "The canonical invoice has no line items; item-level quantity and price matching cannot be completed.",
+        })
+
+    invoice_qty_by_po_index: dict[int, float] = defaultdict(float)
+    invoice_rows_by_po_index: dict[int, list[dict[str, Any]]] = defaultdict(list)
+
+    if po_items and invoice_items:
+        for invoice_item in invoice_items:
+            matched_index = _match_po_item(invoice_item, po_items)
+            description = _item_description(invoice_item) or _item_sku(invoice_item) or "Unnamed invoice item"
+            if matched_index is None:
+                findings.append({
+                    "type": "UNKNOWN_OR_AMBIGUOUS_ITEM",
+                    "details": f"Invoice item '{description}' could not be matched uniquely to a PO line by SKU or exact description.",
+                })
+                continue
+
+            invoice_quantity = _item_quantity(invoice_item, "invoice")
+            if invoice_quantity is None:
+                findings.append({
+                    "type": "INVOICE_QUANTITY_MISSING",
+                    "details": f"Invoice item '{description}' has no valid quantity.",
+                })
+            else:
+                invoice_qty_by_po_index[matched_index] += invoice_quantity
+
+            invoice_price = _item_unit_price(invoice_item, "invoice")
+            po_price = _item_unit_price(po_items[matched_index], "po")
+            if invoice_price is not None and po_price is not None:
+                tolerance = _number(po.get("price_tolerance_percent")) if po else None
+                tolerance = max(tolerance or 0.0, 0.0)
+                allowed_price = po_price * (1.0 + tolerance / 100.0)
+                if invoice_price > allowed_price + 0.0001:
+                    findings.append({
+                        "type": "UNIT_PRICE_EXCEEDED",
+                        "details": (
+                            f"Invoice unit price ({invoice_price:.4f}) for '{description}' exceeds "
+                            f"the PO approved unit price ({po_price:.4f}) plus {tolerance:g}% tolerance."
+                        ),
+                    })
+            elif invoice_price is None or po_price is None:
+                findings.append({
+                    "type": "UNIT_PRICE_NOT_VERIFIABLE",
+                    "details": f"A valid unit price is missing for invoice item '{description}' or its PO line.",
+                })
+
+            invoice_rows_by_po_index[matched_index].append(invoice_item)
+
+        for po_index, invoiced_quantity in invoice_qty_by_po_index.items():
+            po_item = po_items[po_index]
+            description = _item_description(po_item) or f"PO line {po_index + 1}"
+            ordered_quantity = _item_quantity(po_item, "po")
+            if ordered_quantity is None:
+                findings.append({
+                    "type": "PO_QUANTITY_MISSING",
+                    "details": f"PO item '{description}' has no valid ordered quantity.",
+                })
+            elif invoiced_quantity > ordered_quantity + 0.0001:
+                findings.append({
+                    "type": "INVOICE_EXCEEDS_PO_QUANTITY",
+                    "details": f"Invoiced quantity ({invoiced_quantity:g}) for '{description}' exceeds ordered quantity ({ordered_quantity:g}).",
+                })
+
+    if grn is None:
+        findings.append({
+            "type": "MISSING_GRN",
+            "details": f"No canonical goods receipt file was found for PO '{po_id}'.",
+        })
+    else:
+        grn_status = str(grn.get("status") or grn.get("receipt_status") or "UNKNOWN").upper()
+        if grn_status in {"CANCELLED", "VOID"}:
+            findings.append({
+                "type": "GRN_CANCELLED",
+                "details": f"The goods receipt status is '{grn_status}'.",
+            })
+
+        grn_items = _grn_items(grn)
+        if not grn_items:
+            findings.append({
+                "type": "GRN_ITEMS_MISSING",
+                "details": "The goods receipt has no item-level quantities; accepted quantities cannot be verified.",
+            })
+        elif po_items and invoice_items:
+            accepted_by_po_index: dict[int, float] = defaultdict(float)
+            accepted_known_by_po_index: dict[int, bool] = defaultdict(lambda: True)
+            received_by_po_index: dict[int, float] = defaultdict(float)
+            rejected_by_po_index: dict[int, float] = defaultdict(float)
+
+            for grn_item in grn_items:
+                matched_index = _match_po_item(grn_item, po_items)
+                if matched_index is None:
+                    continue
+                accepted = _item_quantity(grn_item, "grn_accepted")
+                received = _item_quantity(grn_item, "grn_received")
+                rejected = _item_quantity(grn_item, "grn_rejected")
+                if accepted is None:
+                    accepted_known_by_po_index[matched_index] = False
                 else:
-                    po_item = po_items_map[sku]
-                    po_qty = po_item.get("quantity", 0)
-                    po_price = po_item.get("unit_price", 0)
+                    accepted_by_po_index[matched_index] += accepted
+                if received is not None:
+                    received_by_po_index[matched_index] += received
+                if rejected is not None:
+                    rejected_by_po_index[matched_index] += rejected
 
-                    if inv_qty > po_qty:
-                        discrepancies.append(("QUANTITY_MISMATCH", f"Invoiced qty ({inv_qty}) for '{sku}' exceeds PO qty ({po_qty})."))
+            for po_index, invoiced_quantity in invoice_qty_by_po_index.items():
+                if not accepted_known_by_po_index[po_index]:
+                    description = _item_description(po_items[po_index]) or f"PO line {po_index + 1}"
+                    findings.append({
+                        "type": "GRN_ACCEPTED_QUANTITY_MISSING",
+                        "details": f"The GRN does not record a valid accepted quantity for '{description}'.",
+                    })
+                    continue
 
-                    if inv_price > po_price:
-                        discrepancies.append(("UNIT_PRICE_HIKE", f"Invoiced unit price ({inv_price}) for '{sku}' exceeds PO price ({po_price})."))
+                accepted_quantity = accepted_by_po_index[po_index]
+                description = _item_description(po_items[po_index]) or f"PO line {po_index + 1}"
+                if invoiced_quantity > accepted_quantity + 0.0001:
+                    findings.append({
+                        "type": "INVOICE_EXCEEDS_ACCEPTED_GRN_QUANTITY",
+                        "details": (
+                            f"Invoiced quantity ({invoiced_quantity:g}) for '{description}' exceeds "
+                            f"the total accepted quantity in the GRN ({accepted_quantity:g})."
+                        ),
+                    })
+                if rejected_by_po_index[po_index] > 0:
+                    findings.append({
+                        "type": "GRN_HAS_REJECTED_QUANTITY",
+                        "details": (
+                            f"The GRN records {rejected_by_po_index[po_index]:g} rejected unit(s) for "
+                            f"'{description}'. Confirm the invoice excludes rejected goods."
+                        ),
+                    })
 
-        # 6. GRN Status Check (if GRN exists)
-        if grn_data:
-            grn_status = grn_data.get("status")
-            if grn_status != "RECEIVED":
-                discrepancies.append(("GRN_NOT_RECEIVED", f"Goods Receipt status is '{grn_status}', not RECEIVED."))
+        pending_inspection = _number(grn.get("total_pending_inspection"))
+        if pending_inspection is not None and pending_inspection > 0:
+            findings.append({
+                "type": "GRN_PENDING_INSPECTION",
+                "details": f"The GRN still has {pending_inspection:g} unit(s) pending inspection.",
+            })
+        elif grn_status == "PENDING_INSPECTION":
+            findings.append({
+                "type": "GRN_PENDING_INSPECTION",
+                "details": "The GRN status indicates that goods are pending inspection.",
+            })
 
-        # 7. Save Timestamped Audit Report to Disk
-        save_audit_report(invoice_number, discrepancies)
-        print("-" * 50)
+    # Compare header totals only when both records contain them. PO total is the
+    # saved, tax-inclusive total, so the PO's configured price tolerance applies.
+    if po is not None:
+        invoice_total = _number(_first_value(invoice.get("total_amount"), invoice.get("total")))
+        po_total = _number(_first_value(po.get("total_amount"), po.get("total")))
+        if invoice_total is not None and po_total is not None:
+            tolerance = _number(po.get("price_tolerance_percent")) or 0.0
+            tolerance = max(tolerance, 0.0)
+            allowed_total = po_total * (1.0 + tolerance / 100.0)
+            if invoice_total > allowed_total + 0.0001:
+                findings.append({
+                    "type": "INVOICE_TOTAL_EXCEEDS_PO",
+                    "details": (
+                        f"Invoice total ({invoice_total:.2f}) exceeds PO total ({po_total:.2f}) "
+                        f"plus {tolerance:g}% tolerance."
+                    ),
+                })
 
-def save_audit_report(invoice_number, discrepancies):
-    # Generate current date and time string (e.g., "2026-11-15_02-58-12")
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    audit_file = AUDIT_DIR / f"audit_{invoice_number}_{timestamp}.json"
-    
-    status = "FLAGGED" if discrepancies else "APPROVED"
-    report_data = {
+    # Remove exact duplicate findings while preserving their first occurrence.
+    unique_findings: list[dict[str, str]] = []
+    seen_findings: set[tuple[str, str]] = set()
+    for finding in findings:
+        key = (finding["type"], finding["details"])
+        if key not in seen_findings:
+            seen_findings.add(key)
+            unique_findings.append(finding)
+
+    result = "DISCREPANCIES_FOUND" if unique_findings else "NO_DISCREPANCIES_FOUND"
+    return {
         "invoice_number": invoice_number,
-        "status": status,
-        "generated_at": timestamp,
-        "discrepancies": [{"type": d[0], "details": d[1]} for d in discrepancies]
+        "po_id": po_id,
+        "source_invoice_file": invoice_path.name,
+        # A clean match is still only a recommendation; it is not approval.
+        "status": "NEEDS_HUMAN_REVIEW",
+        "matching_result": result,
+        "recommendation": "FLAG_FOR_HUMAN_REVIEW" if unique_findings else "MATCHED_PENDING_HUMAN_APPROVAL",
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "discrepancies": unique_findings,
     }
 
-    with open(audit_file, "w", encoding="utf-8") as f:
-        json.dump(report_data, f, indent=4)
 
-    print(f"📋 Timestamped audit saved to disk: {audit_file.name} [{status}]")
+def save_audit_report(
+    invoice_number: Any,
+    report_data: dict[str, Any],
+    *,
+    base_dir: Path | str | None = None,
+) -> Path:
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    audit_dir = root / "data" / "audit_reports"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    audit_file = audit_dir / f"audit_{_safe_filename(invoice_number)}_{timestamp}.json"
+    with audit_file.open("w", encoding="utf-8") as handle:
+        json.dump(report_data, handle, indent=2, ensure_ascii=False)
+    return audit_file
+
+
+def process_orders_sequentially(base_dir: Path | str | None = None) -> list[dict[str, Any]]:
+    """Run matching for canonical invoices only and write one report per invoice."""
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    po_dir = root / "data" / "purchase_orders"
+    grn_dir = root / "data" / "goods_receipts"
+    invoice_dir = root / "data" / "invoices"
+
+    print("📂 Starting canonical JSON three-way matching...\n")
+    if not invoice_dir.is_dir():
+        print(f"⚠️ Invoice directory does not exist: {invoice_dir}")
+        return []
+
+    # IMPORTANT: only inv_<po_id>.json are canonical records. Extraction caches
+    # such as upload_<hash>.pdf.json and invoice5.pdf.json are intentionally ignored.
+    invoice_paths = sorted(invoice_dir.glob("inv_*.json"))
+    if not invoice_paths:
+        print("⚠️ No canonical invoice files (inv_*.json) were found.")
+        return []
+
+    invoice_records: list[tuple[Path, dict[str, Any]]] = []
+    for invoice_path in invoice_paths:
+        invoice = _load_json(invoice_path)
+        if invoice is not None:
+            invoice_records.append((invoice_path, invoice))
+
+    duplicate_keys = _duplicate_invoice_keys(invoice_records)
+    reports: list[dict[str, Any]] = []
+
+    for invoice_path, invoice in invoice_records:
+        po_id = _first_value(invoice.get("po_id"), invoice.get("purchase_order_id"), invoice.get("po_number"))
+        key = _po_key(po_id)
+        if not key:
+            po_path = None
+            grn_path = None
+        else:
+            po_path = po_dir / f"po_{key}.json"
+            grn_path = grn_dir / f"grn_{key}.json"
+
+        po = _load_json(po_path) if po_path is not None and po_path.is_file() else None
+        grn = _load_json(grn_path) if grn_path is not None and grn_path.is_file() else None
+
+        report = _build_report(invoice_path, invoice, po, grn, duplicate_keys)
+        audit_path = save_audit_report(report.get("invoice_number") or invoice_path.stem, report, base_dir=root)
+        reports.append(report)
+
+        print(
+            f"📄 {report.get('invoice_number') or invoice_path.name}: "
+            f"{report['matching_result']} — {report['status']}"
+        )
+        if report["discrepancies"]:
+            for finding in report["discrepancies"]:
+                print(f"   - {finding['type']}: {finding['details']}")
+        print(f"📋 Audit saved: {audit_path.relative_to(root)}\n")
+
+    return reports
+
 
 if __name__ == "__main__":
     process_orders_sequentially()
