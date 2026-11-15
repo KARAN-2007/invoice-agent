@@ -10,6 +10,12 @@ from po_pages import render_po_page
 from grn_pages import render_grn_page
 from finance_pages import render_finance_page
 from approval_evidence import render_approval_evidence
+from approval_workflow import (
+    ROLE_LABELS,
+    decide_approval_stage,
+    get_approval_workflow,
+    role_can_act,
+)
 from agent import run_agent
 from auth import authenticate
 from db_reports import latest_log_id, log_since, recent_log
@@ -28,7 +34,17 @@ from record_store import (
     normalize_po_id,
     save_invoice,
 )
-
+from db_store import (
+    _auto_create_payment_schedule,
+    cancel_payment,                   # ← add
+    decide_request,
+    list_approval_requests,
+    list_payment_schedules,           # ← add
+    mark_payment_paid,                # ← add
+    save_log,
+    save_approval_request,
+    has_queued_approval_request,
+)
 
 INVOICE_DIR = Path(__file__).parent / "invoices"
 EXTRACTED_DIR = Path(__file__).parent / "data" / "invoices"
@@ -36,7 +52,10 @@ EXTRACTED_DIR = Path(__file__).parent / "data" / "invoices"
 ROLE_PAGES = {
     "vendor": ["Upload invoice"],
     "procurement_officer": ["Purchase Orders", "Goods Receipts"],
-    "approver": ["Approvals"],
+    "department_head": ["Approvals"],
+    "finance_officer": ["Approvals"],
+    "final_approver": ["Approvals"],
+    "approver": ["Approvals"],  # Existing accounts continue as final approvers.
     "admin": ["Finance workspace", "Audit log"],
 }
 
@@ -284,8 +303,7 @@ def persist_invoice_business_record(file_name, steps, result):
         "invoice_date": first_value(extracted.get("invoice_date"), extracted.get("date")),
         "currency": extracted.get("currency") or "INR",
         "total_amount": total_amount,
-        "status": "PENDING",
-        "ai_recommendation": result.get("recommendation") or "NEEDS_HUMAN_REVIEW",
+        "status": result.get("recommendation") or "PENDING",
         "items": normalized_items,
         "line_items": normalized_items,
         "source_file": file_name,
@@ -340,6 +358,15 @@ def describe_step(step, detail):
         if status == "mismatch":
             return "Vendor mismatch: " + str(result.get("note", ""))
         return "The vendor check was skipped or could not be completed."
+
+    if step == "matcher:three_way_match":
+        matching_result = str(result.get("matching_result") or "").upper()
+        findings = result.get("discrepancies") or []
+        if matching_result == "NO_DISCREPANCIES_FOUND" and not findings:
+            return "Three-way matching found no discrepancies; human approval is still required."
+        if findings:
+            return "Three-way matching found " + str(len(findings)) + " discrepancy/discrepancies."
+        return "Three-way matching result: " + (matching_result or "inconclusive") + "."
 
     if step == "tool:send_to_human_review":
         return "Sent to human review: " + str(detail.get("reason", ""))
@@ -514,6 +541,40 @@ def build_verification_checks(file_name, steps, result, request_record=None):
         checks.append(make_check(
             "Vendor verification", "not_recorded",
             "No vendor-to-PO verification event was found.",
+        ))
+
+    # Three-way matching is a separate deterministic backend result.
+    matching_event = first_event(steps, "matcher:three_way_match")
+    if matching_event:
+        matching_result = event_result(matching_event)
+        matching_outcome = str(matching_result.get("matching_result") or "").upper()
+        matching_findings = matching_result.get("discrepancies") or []
+        if matching_outcome == "NO_DISCREPANCIES_FOUND" and not matching_findings:
+            checks.append(make_check(
+                "Three-way matching", "passed",
+                "No PO / GRN / invoice discrepancies were found. Human approval is still required.",
+            ))
+        elif matching_findings or matching_outcome == "DISCREPANCIES_FOUND":
+            finding_text = " | ".join(
+                str(item.get("type", "ISSUE")) + ": " + str(item.get("details", ""))
+                for item in matching_findings[:5]
+                if isinstance(item, dict)
+            )
+            checks.append(make_check(
+                "Three-way matching", "review",
+                "The matcher found discrepancies that require human review.",
+                finding_text or "The matcher flagged this invoice for human review.",
+            ))
+        else:
+            checks.append(make_check(
+                "Three-way matching", "not_recorded",
+                "The matcher ran but did not return a recognised result.",
+                str(matching_result.get("recommendation") or ""),
+            ))
+    else:
+        checks.append(make_check(
+            "Three-way matching", "not_recorded",
+            "No three-way matching event was recorded for this invoice.",
         ))
 
     recommendation = result.get("recommendation")
@@ -848,6 +909,7 @@ def upload_page(user):
         steps = []
         st.warning("The invoice was processed, but its execution trace could not be retrieved.")
 
+    structured_path = None
     try:
         structured_path, structured_note = persist_invoice_business_record(
             file_name, steps, result
@@ -866,6 +928,72 @@ def upload_page(user):
         st.warning("The invoice was processed, but its PO-based JSON record could not be saved.")
         st.caption(str(exc)[:250])
 
+    # Run the standalone matcher for this newly saved canonical invoice only.
+    if structured_path is not None:
+        try:
+            from matcher import process_invoice_record
+
+            with st.spinner("Running invoice, purchase order and goods-receipt matching..."):
+                matching_report = process_invoice_record(structured_path)
+
+            if not isinstance(matching_report, dict):
+                raise RuntimeError("The matcher returned an invalid report.")
+
+            matching_event_detail = {
+                "file": file_name,
+                "result": matching_report,
+            }
+            local_matching_event = {
+                "step": "matcher:three_way_match",
+                "detail": matching_event_detail,
+            }
+
+            try:
+                matching_logged = save_log(
+                    "matcher:three_way_match",
+                    matching_event_detail,
+                )
+                if matching_logged is False:
+                    st.warning("Matching completed, but its audit event could not be saved.")
+            except Exception as log_error:
+                st.warning("Matching completed, but its audit event could not be saved.")
+                st.caption(str(log_error)[:150])
+
+            matching_outcome = str(matching_report.get("matching_result") or "").upper()
+            discrepancies = matching_report.get("discrepancies") or []
+            if matching_outcome == "NO_DISCREPANCIES_FOUND" and not discrepancies:
+                st.success("Three-way matching found no discrepancies. Human approval is still required.")
+            else:
+                st.warning(
+                    "Three-way matching requires human review: "
+                    + str(len(discrepancies)) + " finding(s)."
+                )
+                for finding in discrepancies:
+                    if isinstance(finding, dict):
+                        st.caption(
+                            str(finding.get("type") or "ISSUE") + ": "
+                            + str(finding.get("details") or "")
+                        )
+
+            # Refresh the run evidence so the upload report includes matching.
+            try:
+                if last_id is not None:
+                    steps = log_since(last_id)
+                else:
+                    steps = recent_log(500)
+                if not any(
+                    row.get("step") == "matcher:three_way_match"
+                    and event_detail(row).get("file") == file_name
+                    for row in steps if isinstance(row, dict)
+                ):
+                    steps.append(local_matching_event)
+            except Exception:
+                steps.append(local_matching_event)
+
+        except Exception as matching_error:
+            st.warning("The invoice was saved, but three-way matching could not be completed.")
+            st.caption(str(matching_error)[:200])
+
     request_id = result.get("approval_request_id")
     request_record = None
     if request_id is not None:
@@ -883,26 +1011,170 @@ def upload_page(user):
 # ==================================================
 # APPROVALS PAGE
 # ==================================================
+def _render_payment_schedule_tab(user):
+    st.subheader("Upcoming payments")
+
+    st.caption(
+        "Approved invoices appear here automatically. Mark them as paid "
+        "when finance processes the bank transfer."
+    )
+
+    try:
+        scheduled = list_payment_schedules("SCHEDULED")
+        paid = [
+            row
+            for row in list_payment_schedules()
+            if row["payment_status"] != "SCHEDULED"
+        ]
+    except Exception as exc:
+        st.error("Could not reach the payments table.")
+        st.caption(str(exc)[:200])
+        return
+
+    total_scheduled = sum(
+        float(row["invoice_amount"] or 0)
+        for row in scheduled
+    )
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Awaiting payment", len(scheduled))
+    m2.metric("Total scheduled", f"{total_scheduled:,.2f}")
+    m3.metric(
+        "Paid / cancelled",
+        len(paid),
+    )
+
+    if not scheduled:
+        st.success("No payments are waiting to be processed.")
+    else:
+        for row in scheduled:
+            payment_id = row["id"]
+
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+
+                with left:
+                    st.markdown(
+                        "### " + str(row["invoice_number"] or "Invoice")
+                    )
+                    st.caption(
+                        "Vendor: "
+                        + str(row["vendor_name"] or "—")
+                        + " · Department: "
+                        + str(row["department_id"] or "—")
+                        + " · Approval request #"
+                        + str(row["approval_request_id"])
+                    )
+
+                    st.write(
+                        "**Amount:** "
+                        + f"{float(row['invoice_amount'] or 0):,.2f}"
+                    )
+                    st.write(
+                        "**Scheduled for:** "
+                        + str(row["scheduled_payment_date"])
+                    )
+
+                with right:
+                    batch_id = st.text_input(
+                        "Batch ID (optional)",
+                        key="batch_" + str(payment_id),
+                        placeholder="e.g. BATCH-2026-11",
+                    )
+
+                    if st.button(
+                        "Mark as paid",
+                        type="primary",
+                        key="pay_" + str(payment_id),
+                        use_container_width=True,
+                    ):
+                        try:
+                            result = mark_payment_paid(
+                                payment_id,
+                                paid_by=user["username"],
+                                batch_id=batch_id or None,
+                            )
+                            if result:
+                                st.success(
+                                    "Marked as paid: " + str(result)
+                                )
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    "This payment was already processed."
+                                )
+                        except Exception as exc:
+                            st.error("Could not update payment.")
+                            st.caption(str(exc)[:200])
+
+                    if st.button(
+                        "Cancel",
+                        key="cancel_" + str(payment_id),
+                        use_container_width=True,
+                    ):
+                        try:
+                            result = cancel_payment(
+                                payment_id,
+                                cancelled_by=user["username"],
+                            )
+                            if result:
+                                st.info(
+                                    "Payment cancelled: " + str(result)
+                                )
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    "This payment was already processed."
+                                )
+                        except Exception as exc:
+                            st.error("Could not cancel payment.")
+                            st.caption(str(exc)[:200])
+
+    st.divider()
+    st.markdown("### Payment history")
+
+    if not paid:
+        st.caption("No payments have been processed yet.")
+    else:
+        st.dataframe(
+            [
+                {
+                    "Invoice": row["invoice_number"],
+                    "Vendor": row["vendor_name"],
+                    "Amount": f"{float(row['invoice_amount'] or 0):,.2f}",
+                    "Status": row["payment_status"],
+                    "Scheduled": str(row["scheduled_payment_date"]),
+                    "Paid at": str(row["paid_at"] or ""),
+                    "Paid by": row["paid_by"] or "",
+                    "Batch": row["payment_batch_id"] or "",
+                }
+                for row in paid
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 def approvals_page(user):
-    require_role(user, ["approver"])
+    allowed_roles = ["department_head", "finance_officer", "final_approver", "approver"]
+    require_role(user, allowed_roles)
+    user_role = str(user.get("role") or "").strip().lower()
+    role_label = ROLE_LABELS.get(user_role, user_role.replace("_", " ").title())
+
     st.markdown("<div class='page-eyebrow'>HUMAN REVIEW WORKSPACE</div>", unsafe_allow_html=True)
     st.title("Invoice approval center")
-    st.caption("Review the agent's findings, inspect the source invoice, and make the final decision.")
+    st.caption("Three-stage review: Department Head → Finance Officer → Final Approver. Each stage records its own decision.")
 
     if "message" in st.session_state:
         st.success(st.session_state.pop("message"))
 
     try:
-        pending = list_approval_requests("PENDING")
+        all_pending = list_approval_requests("PENDING")
         decided = [row for row in list_approval_requests() if row["status"] != "PENDING"]
     except Exception as exc:
         st.error("Could not reach the database. Check that PostgreSQL is running and that .env is correct.")
         st.caption(str(exc)[:200])
         return
 
-    # Fetch recent audit evidence once, then filter it per invoice in
-    # approval_evidence.py. Failure to load logs does not stop approvals.
     try:
         approval_audit_rows = recent_log(500)
     except Exception as exc:
@@ -910,30 +1182,51 @@ def approvals_page(user):
         st.warning("Audit evidence could not be retrieved. Missing checks will be shown as not recorded.")
         st.caption(str(exc)[:150])
 
+    my_pending = []
+    workflow_by_id = {}
+    workflow_error = None
+    for request in all_pending:
+        try:
+            workflow = get_approval_workflow(request["id"])
+            workflow_by_id[str(request["id"])] = workflow
+            current = workflow.get("current_stage")
+            if current and role_can_act(user_role, current.get("required_role")):
+                my_pending.append(request)
+        except Exception as exc:
+            workflow_error = str(exc)[:200]
+
+    if workflow_error:
+        st.error("The approval workflow could not be loaded. No approval actions are available until the database workflow table is ready.")
+        st.caption(workflow_error)
+        return
+
     approved_count = sum(1 for row in decided if row["status"] == "APPROVED")
     rejected_count = sum(1 for row in decided if row["status"] == "REJECTED")
-
     metric1, metric2, metric3 = st.columns(3)
-    metric1.metric("Awaiting review", len(pending))
-    metric2.metric("Approved", approved_count)
+    metric1.metric("Awaiting your stage", len(my_pending))
+    metric2.metric("Fully approved", approved_count)
     metric3.metric("Rejected", rejected_count)
 
-    st.info("Human control is active: the AI recommendation is advisory. Only an approver can approve or reject an invoice.")
+    st.info(f"Signed in as {role_label}. You can act only when an invoice reaches your assigned stage. AI recommendations remain advisory.")
 
-    queue_tab, history_tab = st.tabs([
-        "Pending review (" + str(len(pending)) + ")",
-        "Decision history (" + str(len(decided)) + ")",
-    ])
+    queue_tab, history_tab, payments_tab = st.tabs(
+        [   "Pending review (" + str(len(my_pending)) + ")",
+            "Decision history (" + str(len(decided)) + ")",
+            "Payment schedule",
+        ]
+    )
 
     with queue_tab:
-        st.subheader("Invoices requiring a decision")
-        if not pending:
-            st.success("You're all caught up. There are no invoices waiting for review.")
-            st.caption("New vendor submissions will appear here after the AI agent finishes checking them.")
+        st.subheader("Invoices awaiting your decision")
+        if not my_pending:
+            st.success("There are no invoices waiting at your approval stage.")
 
-        for req in pending:
+        for req in my_pending:
             request_id = str(req["id"])
             file_name = req["file_name"]
+            workflow = workflow_by_id.get(request_id) or get_approval_workflow(req["id"])
+            stages = workflow.get("stages", [])
+            current = workflow.get("current_stage") or {}
             needs_review = req["recommendation"] == "NEEDS_HUMAN_REVIEW"
 
             with st.container(border=True):
@@ -941,15 +1234,29 @@ def approvals_page(user):
                 with header_left:
                     st.markdown("### Review request #" + request_id)
                     st.caption(file_name)
+                    st.caption("Current stage: " + str(current.get("stage_label") or "Unknown"))
                 with header_right:
                     if needs_review:
                         st.warning("Human review needed")
                     else:
-                        st.success("No issue flagged")
+                        st.success("No issue flagged by AI")
 
+                st.markdown("**Approval progress**")
+                progress_rows = [
+                    {
+                        "Stage": row.get("stage_label"),
+                        "Assigned role": str(row.get("required_role") or "").replace("_", " ").title(),
+                        "Status": row.get("status"),
+                        "Decided by": row.get("decided_by") or "—",
+                        "Decision time": str(row.get("decided_at") or "—"),
+                        "Note": row.get("decision_note") or "—",
+                    }
+                    for row in stages
+                ]
+                st.dataframe(progress_rows, use_container_width=True, hide_index=True)
                 st.divider()
-                detail_left, detail_right = st.columns([1, 1.15], gap="large")
 
+                detail_left, detail_right = st.columns([1, 1.15], gap="large")
                 with detail_left:
                     st.markdown("**AI assessment**")
                     review_reason_text = req.get("review_reason") or ""
@@ -960,16 +1267,14 @@ def approvals_page(user):
                     else:
                         st.success("The agent found no blocking issues in its checks.")
 
-                    # NEW: render invoice-specific evidence before the summary.
                     render_approval_evidence(file_name, approval_audit_rows)
-
                     st.divider()
-                    if req["summary"]:
+                    if req.get("summary"):
                         st.markdown("**Agent summary**")
                         st.write(req["summary"])
                     else:
                         st.caption("The agent did not provide a summary.")
-                    st.caption("Recommendation: " + str(req["recommendation"]))
+                    st.caption("AI recommendation: " + str(req["recommendation"]))
 
                 with detail_right:
                     st.markdown("**Invoice details extracted by AI**")
@@ -978,51 +1283,91 @@ def approvals_page(user):
                         show_original(file_name, request_id)
 
                 st.divider()
-                st.markdown("**Your decision**")
+                st.markdown("**Your stage decision · " + str(current.get("stage_label") or role_label) + "**")
                 note = st.text_input(
                     "Reviewer note (optional)",
-                    key="note_" + request_id,
+                    key="note_" + request_id + "_" + user_role,
                     placeholder="Explain your decision or note any follow-up needed...",
                 )
-
                 action_left, action_right, _ = st.columns([1, 1, 2])
                 decision = None
-                if action_left.button("Approve invoice", type="primary", key="approve_" + request_id, use_container_width=True):
+                if action_left.button("Approve this stage", type="primary", key="approve_stage_" + request_id + "_" + user_role, use_container_width=True):
                     decision = "APPROVED"
-                if action_right.button("Reject invoice", type="secondary", key="reject_" + request_id, use_container_width=True):
+                if action_right.button("Reject invoice", type="secondary", key="reject_stage_" + request_id + "_" + user_role, use_container_width=True):
                     decision = "REJECTED"
 
                 if decision:
                     try:
-                        done = decide_request(req["id"], decision, user["username"], note)
-                        if done:
-                            st.session_state["message"] = decision.capitalize() + ": " + str(done)
+                        outcome = decide_approval_stage(
+                            req["id"], decision, user["username"], user_role, note
+                        )
+                        if outcome["request_status"] == "APPROVED":
+                            message = "Invoice fully approved after all three stages: " + str(file_name)
+
+                            # ── PAYMENT HOOK ──
+                            # The workflow reached its final stage and approved.
+                            # Create the payment schedule now. Idempotent: if
+                            # decide_approval_stage already did this, the
+                            # ON CONFLICT clause means nothing extra happens.
+                            try:
+                                _auto_create_payment_schedule(
+                                    approval_request_id=req["id"],
+                                    invoice_number=file_name,
+                                )
+                            except Exception as pay_exc:
+                                # Never let a payment-schedule failure undo
+                                # an approval that the approver just made.
+                                message += (
+                                    " WARNING: payment schedule could not be created: "
+                                    + str(pay_exc)[:120]
+                                )
+
+                        elif outcome["request_status"] == "REJECTED":
+                            message = "Invoice rejected at " + str(outcome["stage"]) + ": " + str(file_name)
                         else:
-                            st.session_state["message"] = "That request was already decided."
+                            message = (
+                                str(outcome["stage"]) + " approved. Next stage: "
+                                + str(outcome["next_stage"]) + "."
+                            )
+                        if not outcome.get("audit_recorded"):
+                            message += " WARNING: the decision was saved, but its audit event could not be written."
+                        st.session_state["message"] = message
                     except Exception as exc:
-                        st.session_state["message"] = "Could not save the decision. Please check the database connection."
-                        st.error(str(exc)[:200])
+                        st.error("Could not save the stage decision.")
+                        st.caption(str(exc)[:200])
                     st.rerun()
 
     with history_tab:
-        st.subheader("Previously decided invoices")
+        st.subheader("Completed approval workflows")
         if decided:
-            history_rows = [
-                {
+            history_rows = []
+            for row in decided:
+                try:
+                    workflow = get_approval_workflow(row["id"])
+                    stages = workflow.get("stages", [])
+                    stage_summary = " → ".join(
+                        str(stage.get("stage_label")) + ": " + str(stage.get("status"))
+                        for stage in stages
+                    ) if stages else "Legacy single-stage decision"
+                except Exception:
+                    stage_summary = "Stage history unavailable"
+                history_rows.append({
                     "Request": row["id"],
                     "Invoice": row["file_name"],
                     "AI recommendation": row["recommendation"],
-                    "Flagged for": short_reasons(row["review_reason"]),
-                    "Human decision": row["status"],
-                    "Decided by": row["decided_by"],
-                    "Decision time": row["decided_at"],
-                    "Reviewer note": row["decision_note"],
-                }
-                for row in decided
-            ]
+                    "Flagged for": short_reasons(row.get("review_reason")),
+                    "Approval stages": stage_summary,
+                    "Final decision": row["status"],
+                    "Final reviewer": row.get("decided_by"),
+                    "Decision time": row.get("decided_at"),
+                    "Reviewer note": row.get("decision_note"),
+                })
             st.dataframe(history_rows, use_container_width=True, hide_index=True)
         else:
-            st.caption("No approval decisions have been recorded yet.")
+            st.caption("No completed approval workflows have been recorded yet.")
+
+    with payments_tab:
+        _render_payment_schedule_tab(user)
 
 
 # ==================================================

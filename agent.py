@@ -8,6 +8,7 @@ from google.genai import types
 
 from agent_tools import (
     check_dataset_rules,
+    check_department_budget,
     check_invoice_math,
     check_vendor_matches_po,
     get_dataset_result,
@@ -212,6 +213,23 @@ def _ensure_required_tool_checks(file_name):
             "error": str(exc)[:180],
         }
         failures["check_dataset_rules"] = str(exc)[:180]
+
+    # Always run the department-budget check from Python as a safety net,
+    # even if Gemini did not call the tool. The tool is cached per invoice,
+    # so this does not duplicate a successful Gemini tool call.
+    try:
+        results["check_department_budget"] = check_department_budget(file_name)
+    except Exception as exc:
+        budget_failure = {
+            "budget_ok": None,
+            "note": "Budget check failed and could not be verified: " + str(exc)[:180],
+        }
+        results["check_department_budget"] = budget_failure
+        failures["check_department_budget"] = str(exc)[:180]
+        _safe_log(
+            "tool:check_department_budget",
+            {"file": file_name, "result": budget_failure},
+        )
 
     _safe_log(
         "agent:required_checks_completed",

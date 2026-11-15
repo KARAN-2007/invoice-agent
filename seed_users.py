@@ -18,6 +18,7 @@ DEMO_USERS = [
         "procurement_officer",
         "procurement123",
     ),
+    
     (
         "approver1",
         "Demo Approver",

@@ -3,6 +3,10 @@
 Canonical saved PO path: data/purchase_orders/po_<po_id>.json
 Existing reference_data.json records remain read-only fixtures. New POs are
 saved separately and merged into this page for subsequent viewing.
+
+Department and cost-centre choices are fictional demo mappings. They are
+saved on newly created POs so the budget-validation workflow can resolve the
+PO's department; they do not represent actual university financial data.
 """
 
 import json
@@ -22,10 +26,14 @@ BASE_DIR = Path(__file__).resolve().parent
 REFERENCE_FILE = BASE_DIR / "dataset" / "reference_data.json"
 PO_DATA_DIR = BASE_DIR / "data" / "purchase_orders"
 
+# Department IDs and names are read from dataset/reference_data.json.
+# These are demo reference records, not verified university finance data.
+
 
 # ==================================================
 # DATA HELPERS
 # ==================================================
+
 
 def _load_saved_purchase_orders(base_dir=None):
     """Load records already saved as data/purchase_orders/po_<id>.json."""
@@ -145,6 +153,44 @@ def get_po_number(po):
     return str(po.get("po_number") or "Not assigned")
 
 
+def get_po_department(po):
+    return str(po.get("department") or "UNASSIGNED")
+
+
+def get_po_department_id(po):
+    return str(po.get("department_id") or "UNASSIGNED")
+
+
+def get_po_cost_center(po):
+    return str(po.get("cost_center") or "UNASSIGNED")
+
+
+def get_department_options(reference):
+    """Return valid department master records from the dataset reference."""
+    departments = reference.get("departments", []) if isinstance(reference, dict) else []
+    if not isinstance(departments, list):
+        return []
+
+    options = []
+    seen_ids = set()
+    for row in departments:
+        if not isinstance(row, dict):
+            continue
+        department_id = str(row.get("department_id") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not department_id or not name or department_id in seen_ids:
+            continue
+        seen_ids.add(department_id)
+        options.append({
+            "department_id": department_id,
+            "name": name,
+            # A cost centre is only populated if the reference master supplies it.
+            "cost_center": str(row.get("cost_center") or "").strip() or None,
+        })
+
+    return sorted(options, key=lambda item: (item["name"].casefold(), item["department_id"]))
+
+
 def get_status(po):
     return str(po.get("status") or "UNKNOWN").upper()
 
@@ -213,8 +259,12 @@ def get_vendor_id(reference, vendor_name):
             if str(name or "").strip() == str(vendor_name or "").strip():
                 return vendor.get("vendor_id") or vendor.get("id")
 
-    for po in reference.get("purchase_orders", []) if isinstance(reference.get("purchase_orders"), list) else []:
-        if isinstance(po, dict) and str(get_po_vendor(po)).strip() == str(vendor_name).strip():
+    purchase_orders = reference.get("purchase_orders", [])
+    for po in purchase_orders if isinstance(purchase_orders, list) else []:
+        if (
+            isinstance(po, dict)
+            and str(get_po_vendor(po)).strip() == str(vendor_name).strip()
+        ):
             return po.get("vendor_id")
 
     return None
@@ -244,6 +294,7 @@ def get_dataframe_height(row_count, max_height=900):
 # PO DETAILS
 # ==================================================
 
+
 def render_po_details(po):
     st.markdown("### Purchase order details")
 
@@ -270,6 +321,20 @@ def render_po_details(po):
         tolerance = po.get("price_tolerance_percent")
         st.write(str(tolerance) + "%" if tolerance is not None else "-")
 
+    st.markdown("**Department and budget mapping**")
+    mapping1, mapping2, mapping3 = st.columns(3)
+    with mapping1:
+        st.write("**Department**")
+        st.write(get_po_department(po))
+    with mapping2:
+        st.write("**Department ID**")
+        st.write(get_po_department_id(po))
+    with mapping3:
+        st.write("**Cost centre**")
+        st.write(get_po_cost_center(po))
+    if get_po_department(po) == "UNASSIGNED":
+        st.caption("Budget validation cannot be completed until this PO is mapped.")
+
     st.markdown("**Order status**")
     render_status(get_status(po))
     st.divider()
@@ -286,7 +351,11 @@ def render_po_details(po):
             "Description": item.get("description") or "-",
             "Quantity ordered": item.get("quantity_ordered", "-"),
             "Approved unit price": format_amount(item.get("approved_unit_price"), currency),
-            "Tax rate": str(item.get("tax_percent")) + "%" if item.get("tax_percent") is not None else "Not specified",
+            "Tax rate": (
+                str(item.get("tax_percent")) + "%"
+                if item.get("tax_percent") is not None
+                else "Not specified"
+            ),
         })
 
     st.dataframe(
@@ -301,13 +370,20 @@ def render_po_details(po):
 # DASHBOARD
 # ==================================================
 
+
 def render_po_dashboard(purchase_orders):
     st.markdown("### Procurement overview")
 
     total = len(purchase_orders)
     approved = sum(1 for po in purchase_orders if get_status(po) == "APPROVED")
-    pending = sum(1 for po in purchase_orders if get_status(po) in ("PENDING", "SUBMITTED", "DRAFT"))
-    cancelled = sum(1 for po in purchase_orders if get_status(po) in ("CANCELLED", "REJECTED"))
+    pending = sum(
+        1 for po in purchase_orders
+        if get_status(po) in ("PENDING", "SUBMITTED", "DRAFT")
+    )
+    cancelled = sum(
+        1 for po in purchase_orders
+        if get_status(po) in ("CANCELLED", "REJECTED")
+    )
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total purchase orders", total)
@@ -327,6 +403,9 @@ def render_po_dashboard(purchase_orders):
         rows.append({
             "PO Number": get_po_number(po),
             "Vendor": get_po_vendor(po),
+            "Department": get_po_department(po),
+            "Department ID": get_po_department_id(po),
+            "Cost centre": get_po_cost_center(po),
             "Status": get_status(po),
             "Currency": po.get("currency") or "-",
             "Line items": len(get_items(po)),
@@ -345,6 +424,7 @@ def render_po_dashboard(purchase_orders):
 # PURCHASE ORDER LIST
 # ==================================================
 
+
 def render_po_list(purchase_orders):
     st.markdown("### All purchase orders")
 
@@ -356,11 +436,15 @@ def render_po_list(purchase_orders):
 
     statuses = sorted({get_status(po) for po in purchase_orders})
     status_options = ["All statuses"] + statuses
-    selected_status = st.selectbox("Filter by status", status_options, key="po_status_filter")
+    selected_status = st.selectbox(
+        "Filter by status", status_options, key="po_status_filter"
+    )
 
     vendors = sorted({get_po_vendor(po) for po in purchase_orders})
     vendor_options = ["All vendors"] + vendors
-    selected_vendor = st.selectbox("Filter by vendor", vendor_options, key="po_vendor_filter")
+    selected_vendor = st.selectbox(
+        "Filter by vendor", vendor_options, key="po_vendor_filter"
+    )
 
     filtered = []
     for po in purchase_orders:
@@ -384,6 +468,9 @@ def render_po_list(purchase_orders):
         table.append({
             "PO Number": get_po_number(po),
             "Vendor": get_po_vendor(po),
+            "Department": get_po_department(po),
+            "Department ID": get_po_department_id(po),
+            "Cost centre": get_po_cost_center(po),
             "Status": get_status(po),
             "Currency": po.get("currency") or "-",
             "Line items": len(get_items(po)),
@@ -398,14 +485,19 @@ def render_po_list(purchase_orders):
 
     st.divider()
     po_numbers = [get_po_number(po) for po in filtered]
-    selected_po = st.selectbox("Select a PO to inspect", po_numbers, key="po_detail_selection")
-    selected_record = next(po for po in filtered if get_po_number(po) == selected_po)
+    selected_po = st.selectbox(
+        "Select a PO to inspect", po_numbers, key="po_detail_selection"
+    )
+    selected_record = next(
+        po for po in filtered if get_po_number(po) == selected_po
+    )
     render_po_details(selected_record)
 
 
 # ==================================================
 # CREATE PURCHASE ORDER - PREVIEW + SAVE
 # ==================================================
+
 
 def render_create_po(reference, user=None):
     st.markdown("### Create a purchase order")
@@ -458,7 +550,51 @@ def render_create_po(reference, user=None):
         )
 
         st.divider()
-        st.markdown("#### 2. Purchase order items")
+        st.markdown("#### 2. Department and budget mapping")
+        st.caption(
+            "Select a department from dataset/reference_data.json. The department "
+            "ID is saved on the PO so the budget checker can resolve it. The "
+            "department budgets in this dataset are demonstration figures, not "
+            "verified university financial data."
+        )
+        department_options = get_department_options(reference)
+        selected_department = None
+        if department_options:
+            department_labels = {
+                f"{item['name']} ({item['department_id']})": item
+                for item in department_options
+            }
+            selected_label = st.selectbox(
+                "Department",
+                options=list(department_labels),
+                key="po_department",
+            )
+            selected_department = department_labels[selected_label]
+            department = selected_department["name"]
+            department_id = selected_department["department_id"]
+            cost_center = selected_department.get("cost_center")
+            st.caption(f"Department ID: {department_id}")
+            if cost_center:
+                st.caption(f"Cost centre: {cost_center}")
+            else:
+                st.caption("Cost-centre master data is not available; left unassigned.")
+        else:
+            department = None
+            department_id = None
+            cost_center = None
+            st.warning(
+                "No department records with IDs were found in the reference data. "
+                "This PO cannot be created with a verified department mapping."
+            )
+            st.selectbox(
+                "Department",
+                options=["No department records available"],
+                disabled=True,
+                key="po_department_unavailable",
+            )
+
+        st.divider()
+        st.markdown("#### 3. Purchase order items")
         st.caption(
             "Enter the agreed unit price from the vendor quotation. Quantity and price "
             "start blank, so you do not need to clear default numbers."
@@ -538,11 +674,21 @@ def render_create_po(reference, user=None):
                     for item in normalized_items
                 )
                 po_id = get_next_po_id(reference.get("purchase_orders", []))
+                if not isinstance(selected_department, dict):
+                    st.error(
+                        "A department ID from the reference data is required. "
+                        "The PO preview was not created."
+                    )
+                    return
+
                 st.session_state["po_draft_preview"] = {
                     "po_id": po_id,
                     "po_number": f"PO-{po_id}",
                     "vendor": vendor_name,
                     "vendor_id": get_vendor_id(reference, vendor_name),
+                    "department": department,
+                    "department_id": department_id,
+                    "cost_center": cost_center,
                     "currency": currency,
                     "tolerance": tolerance,
                     "items": normalized_items,
@@ -565,8 +711,12 @@ def render_create_po(reference, user=None):
         c2.metric("Vendor", draft["vendor"])
         c3.metric("Line items", len(draft["items"]))
         st.caption(
-            f"PO ID: {draft['po_id']} · Price tolerance: {draft['tolerance']}% · Status after save: PENDING"
+            f"PO ID: {draft['po_id']} · Price tolerance: {draft['tolerance']}% "
+            "· Status after save: PENDING"
         )
+        st.write(f"**Department:** {draft.get('department', 'UNASSIGNED')}")
+        st.write(f"**Department ID:** {draft.get('department_id', 'UNASSIGNED')}")
+        st.write(f"**Cost centre:** {draft.get('cost_center') or 'UNASSIGNED'}")
 
         st.markdown("**Items**")
         preview_rows = []
@@ -574,7 +724,9 @@ def render_create_po(reference, user=None):
             preview_rows.append({
                 "Description": item["description"],
                 "Quantity": item["quantity_ordered"],
-                "Unit price": format_amount(item["approved_unit_price"], draft["currency"]),
+                "Unit price": format_amount(
+                    item["approved_unit_price"], draft["currency"]
+                ),
                 "Tax": "Not specified",
             })
         st.dataframe(
@@ -585,9 +737,15 @@ def render_create_po(reference, user=None):
         )
 
         st.markdown("**Financial summary**")
-        st.write("PO subtotal before tax: " + format_amount(draft["subtotal"], draft["currency"]))
+        st.write(
+            "PO subtotal before tax: "
+            + format_amount(draft["subtotal"], draft["currency"])
+        )
         st.write("Tax: Not specified — use the approved quotation or item tax master.")
-        st.subheader("PO subtotal (tax not included): " + format_amount(draft["total"], draft["currency"]))
+        st.subheader(
+            "PO subtotal (tax not included): "
+            + format_amount(draft["total"], draft["currency"])
+        )
 
         save_col, clear_col = st.columns(2)
         if save_col.button(
@@ -600,7 +758,9 @@ def render_create_po(reference, user=None):
                 # Recheck IDs immediately before writing so a stale preview
                 # cannot replace a PO created by another session.
                 latest_reference = load_procurement_data()
-                latest_next_id = get_next_po_id(latest_reference.get("purchase_orders", []))
+                latest_next_id = get_next_po_id(
+                    latest_reference.get("purchase_orders", [])
+                )
                 if latest_next_id != int(draft["po_id"]):
                     st.error(
                         f"The next PO ID is now {latest_next_id}. Clear this preview "
@@ -614,6 +774,9 @@ def render_create_po(reference, user=None):
                         "vendor_id": draft.get("vendor_id"),
                         "vendor": draft["vendor"],
                         "vendor_name": draft["vendor"],
+                        "department": draft.get("department"),
+                        "department_id": draft.get("department_id"),
+                        "cost_center": draft.get("cost_center"),
                         "currency": draft["currency"],
                         "price_tolerance_percent": float(draft["tolerance"]),
                         "status": "PENDING",
@@ -650,6 +813,7 @@ def render_create_po(reference, user=None):
 # ==================================================
 # MAIN PO PAGE
 # ==================================================
+
 
 def render_po_page(user):
     """Render the purchase order management interface."""

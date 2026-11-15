@@ -607,7 +607,24 @@ def check_department_budget(file_name: str) -> dict:
 
     # 5. Compute the check.
     allocated = _to_float(department.get("budget_allocated"))
-    consumed = _to_float(department.get("budget_consumed")) or 0.0
+    consumed = _to_float(department.get("budget_consumed"))
+
+    # Missing/invalid consumed amounts must not be treated as zero. Doing so
+    # could incorrectly mark an invoice as within budget.
+    if consumed is None:
+        result = {
+            "budget_ok": None,
+            "department_id": department_id,
+            "department_name": department.get("name"),
+            "invoice_total": invoice_total,
+            "note": "Department has no valid budget_consumed value; budget check could not be verified.",
+        }
+        log_step(
+            "tool:check_department_budget",
+            {"file": file_name, "result": result},
+        )
+        return _store_cached(key, result)
+
 
     if allocated is None:
         result = {

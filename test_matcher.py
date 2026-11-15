@@ -140,3 +140,42 @@ def test_duplicate_invoice_number_for_same_vendor_is_reported(tmp_path):
         "DUPLICATE_INVOICE" in {item["type"] for item in report["discrepancies"]}
         for report in reports
     )
+
+
+def test_process_invoice_record_matches_only_requested_canonical_invoice(tmp_path):
+    setup_records(tmp_path)
+    write_json(tmp_path / "data/purchase_orders/po_120.json", {
+        "po_id": 120,
+        "vendor_id": "VEN-120",
+        "vendor_name": "Other Vendor",
+        "items": [],
+    })
+    write_json(tmp_path / "data/invoices/inv_120.json", {
+        "po_id": 120,
+        "vendor_id": "VEN-120",
+        "invoice_number": "INV-120",
+        "total_amount": 99,
+        "items": [],
+    })
+
+    invoice_path = tmp_path / "data/invoices/inv_119.json"
+    report = matcher.process_invoice_record(invoice_path, base_dir=tmp_path)
+
+    assert report["invoice_number"] == "INV-119"
+    assert report["status"] == "NEEDS_HUMAN_REVIEW"
+    assert Path(report["audit_report_path"]).name.startswith("audit_INV-119_")
+    audit_files = list((tmp_path / "data/audit_reports").glob("audit_*.json"))
+    assert len(audit_files) == 1
+
+
+def test_process_invoice_record_rejects_extraction_cache_path(tmp_path):
+    setup_records(tmp_path)
+    cache_path = tmp_path / "data/invoices/upload_abc.pdf.json"
+    write_json(cache_path, {"invoice_number": "CACHE-1", "po_id": 119})
+
+    try:
+        matcher.process_invoice_record(cache_path, base_dir=tmp_path)
+    except ValueError as exc:
+        assert "canonical" in str(exc).lower()
+    else:
+        raise AssertionError("Expected extraction-cache path to be rejected")
