@@ -93,8 +93,8 @@ SYSTEM_PROMPT = """You are an accounts payable agent for a university. You check
 Work through these steps in order:
 1. Call read_invoice to get the invoice data.
 2. Call check_invoice_math to check its arithmetic.
-3. If the invoice has a PO number, call lookup_po with it exactly as printed.
-4. If lookup_po finds the PO exactly, call check_vendor_matches_po.
+3. If the invoice has a PO number, call lookup_po with the current file_name and the PO exactly as printed.
+4. If lookup_po finds the PO exactly, call check_vendor_matches_po with the current file_name and PO number.
 5. Always call check_dataset_rules exactly once.
 6. Treat the recommendation and findings from check_dataset_rules as authoritative.
 7. If the dataset recommendation is NEEDS_HUMAN_REVIEW, report all returned reason codes.
@@ -146,7 +146,7 @@ def _ensure_required_tool_checks(file_name):
     if po_number is not None and str(po_number).strip():
         po_number = str(po_number).strip().upper()
         try:
-            po_result = lookup_po(po_number)
+            po_result = lookup_po(file_name, po_number)
             results["lookup_po"] = po_result
         except Exception as exc:
             po_result = {"status": "error", "note": str(exc)[:180]}
