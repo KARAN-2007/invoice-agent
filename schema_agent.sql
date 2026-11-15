@@ -33,3 +33,26 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Payment schedules. One row per approved invoice that is queued for payout.
+CREATE TABLE IF NOT EXISTS payment_schedules (
+    id SERIAL PRIMARY KEY,
+    approval_request_id INT NOT NULL REFERENCES approval_requests(id),
+    vendor_name VARCHAR(255),
+    invoice_number VARCHAR(100),
+    department_id VARCHAR(50),
+    invoice_amount NUMERIC(14, 2) NOT NULL,
+    scheduled_payment_date DATE NOT NULL,
+    payment_status VARCHAR(20) DEFAULT 'SCHEDULED'
+        CHECK (payment_status IN ('SCHEDULED', 'PAID', 'CANCELLED')),
+    payment_batch_id VARCHAR(50),
+    paid_at TIMESTAMP,
+    paid_by VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (approval_request_id)
+);
+
+CREATE INDEX IF NOT EXISTS payment_schedules_status_date_idx
+    ON payment_schedules (payment_status, scheduled_payment_date);
+
+
