@@ -488,113 +488,103 @@ def list_approval_requests(status=None):
 # 6. HUMAN APPROVAL AND REJECTION
 # ==================================================
 
+
 def _auto_create_payment_schedule(approval_request_id, invoice_number):
-    """
-    Create a payment schedule for an approved invoice.
-
-    Reads the extracted invoice JSON to get the amount and the
-    reference PO to get the department. Falls back to defaults if
-    either is missing — a scheduled payment is better than no
-    record at all.
-    """
+    """Create a payment schedule only from complete, verified invoice data."""
     import json
+    from decimal import Decimal, InvalidOperation
     from datetime import date, timedelta
-    from pathlib import Path
 
-    base = Path(__file__).resolve().parent
+    invoice_file = str(invoice_number or "").strip()
+    if not invoice_file or Path(invoice_file).name != invoice_file:
+        raise ValueError("Invalid invoice reference for payment scheduling.")
 
-    invoice_amount = 0.0
-    vendor_name = None
-    department_id = None
+    extracted_path = BASE_DIR / "data" / "invoices" / (invoice_file + ".json")
+    if not extracted_path.is_file():
+        raise FileNotFoundError("Extracted invoice data was not found: " + invoice_file)
 
-    extracted_path = base / "data" / "invoices" / (invoice_number + ".json")
-    if extracted_path.is_file():
-        try:
-            data = json.loads(extracted_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "_cache_version" in data:
-                data = data.get("data", {})
-            if isinstance(data, dict):
-                invoice_amount = float(
-                    data.get("total_amount") or data.get("total") or 0.0
-                )
-                vendor_name = data.get("vendor") or data.get("vendor_name")
+    data = json.loads(extracted_path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "_cache_version" in data:
+        data = data.get("data", {})
+    if not isinstance(data, dict):
+        raise ValueError("Invoice extraction data is invalid.")
 
-                # Resolve department from PO.
-                po_ref = data.get("po_number") or data.get("po_reference")
-                if po_ref:
-                    try:
-                        from tools import find_po
-                        result = find_po(po_ref)
-                        if result.get("status") == "found":
-                            department_id = result["po"].get("department_id")
-                    except Exception:
-                        pass
-        except Exception as exc:
-            print(
-                "  [warning] Could not read invoice for payment schedule:",
-                str(exc)[:120],
-            )
+    raw_amount = (
+        data.get("total_amount")
+        or data.get("total")
+        or data.get("grand_total")
+        or data.get("invoice_total")
+        or data.get("amount_due")
+    )
+    try:
+        amount = Decimal(str(raw_amount).replace(",", "").replace("₹", "").replace("$", "").strip())
+    except (InvalidOperation, TypeError, ValueError, AttributeError):
+        raise ValueError("Invoice has no valid total amount.")
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Invoice amount must be greater than zero.")
 
-    # Net 30 default.
-    scheduled_date = date.today() + timedelta(days=30)
+    vendor_value = data.get("vendor") or data.get("vendor_name")
+    if isinstance(vendor_value, dict):
+        vendor_value = (
+            vendor_value.get("name")
+            or vendor_value.get("vendor_name")
+            or vendor_value.get("supplier_name")
+        )
+    vendor_name = str(vendor_value or "").replace("\r", "\n").split("\n", 1)[0].strip()
+    if not vendor_name:
+        raise ValueError("Invoice vendor name is missing.")
+
+    po_ref = data.get("po_number") or data.get("po_reference") or data.get("purchase_order")
+    if not po_ref:
+        raise ValueError("Invoice PO reference is missing.")
+
+    from tools import find_po
+    po_result = find_po(po_ref)
+    if not isinstance(po_result, dict) or po_result.get("status") != "found":
+        raise ValueError("Purchase order could not be verified for payment scheduling.")
+    po = po_result.get("po") or {}
+    department_id = po.get("department_id")
+    if not department_id:
+        raise ValueError("The purchase order has no department assigned.")
 
     return create_payment_schedule(
         approval_request_id=approval_request_id,
-        invoice_amount=invoice_amount,
-        scheduled_payment_date=scheduled_date,
+        invoice_amount=amount,
+        scheduled_payment_date=date.today() + timedelta(days=30),
         vendor_name=vendor_name,
-        invoice_number=invoice_number,
+        invoice_number=invoice_file,
         department_id=department_id,
     )
 
+
 def decide_request(request_id, decision, decided_by, note):
-    """
-    Record a human decision.
-
-    Only a pending request can be approved or rejected.
-    """
-
+    """Record a legacy single-stage decision for a pending request."""
     if decision not in ("APPROVED", "REJECTED"):
-        raise ValueError(
-            "decision must be APPROVED or REJECTED"
-        )
+        raise ValueError("decision must be APPROVED or REJECTED")
 
     conn = get_connection()
-
     try:
         with conn.cursor() as cur:
-
             cur.execute(
                 """
                 UPDATE approval_requests
-                SET
-                    status = %s,
+                SET status = %s,
                     decided_by = %s,
                     decided_at = CURRENT_TIMESTAMP,
                     decision_note = %s
-                WHERE id = %s
-                  AND status = 'PENDING'
+                WHERE id = %s AND status = 'PENDING'
                 RETURNING file_name;
                 """,
-                (
-                    decision,
-                    decided_by,
-                    note,
-                    request_id,
-                ),
+                (decision, decided_by, note, request_id),
             )
-
             row = cur.fetchone()
-
         conn.commit()
-
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
         raise
-
     finally:
         conn.close()
 
@@ -602,7 +592,6 @@ def decide_request(request_id, decision, decided_by, note):
         return None
 
     invoice_number = row[0]
-
     save_log(
         "human:" + decision.lower(),
         {
@@ -613,21 +602,15 @@ def decide_request(request_id, decision, decided_by, note):
         },
     )
 
-    # Approved invoices automatically enter the payment queue.
     if decision == "APPROVED":
         try:
-            _auto_create_payment_schedule(
-                approval_request_id=request_id,
-                invoice_number=invoice_number,
-            )
+            _auto_create_payment_schedule(request_id, invoice_number)
         except Exception as exc:
-            # Never let a payment-schedule failure undo a human decision.
-            print(
-                "  [warning] Could not create payment schedule:",
-                str(exc)[:150],
-            )
+            # The human decision remains saved; payment scheduling can be retried.
+            print("  [warning] Could not create payment schedule:", str(exc)[:150])
 
     return invoice_number
+
 
 # ==================================================
 # 7. PAYMENT SCHEDULES
@@ -658,151 +641,160 @@ def create_payment_schedule(
     invoice_number=None,
     department_id=None,
 ):
-    """
-    Create a payment schedule row for an approved request.
-
-    Safe to call twice: if a row already exists for this request,
-    the existing row's ID is returned instead of creating a duplicate.
-    """
-
-    conn = get_connection()
+    """Create one schedule only for a fully approved request; safe to retry."""
+    from datetime import date, datetime
+    from decimal import Decimal, InvalidOperation
 
     try:
+        amount = Decimal(str(invoice_amount))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("Invalid payment amount.")
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Payment amount must be greater than zero.")
+
+    vendor_name = str(vendor_name or "").strip()
+    invoice_number = str(invoice_number or "").strip()
+    department_id = str(department_id or "").strip()
+    if not vendor_name:
+        raise ValueError("Vendor name is required.")
+    if not invoice_number:
+        raise ValueError("Invoice number is required.")
+    if not department_id:
+        raise ValueError("Department is required.")
+
+    if isinstance(scheduled_payment_date, datetime):
+        scheduled_payment_date = scheduled_payment_date.date()
+    elif isinstance(scheduled_payment_date, str):
+        try:
+            scheduled_payment_date = date.fromisoformat(scheduled_payment_date)
+        except ValueError:
+            raise ValueError("Invalid scheduled payment date.")
+    if not isinstance(scheduled_payment_date, date):
+        raise ValueError("A valid scheduled payment date is required.")
+
+    conn = get_connection()
+    created = False
+    try:
         with conn.cursor() as cur:
+            # Lock the request row so concurrent attempts cannot race approval status.
             cur.execute(
-                """
-                INSERT INTO payment_schedules
-                (
-                    approval_request_id,
-                    vendor_name,
-                    invoice_number,
-                    department_id,
-                    invoice_amount,
-                    scheduled_payment_date
-                )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (approval_request_id) DO NOTHING
-                RETURNING id;
-                """,
-                (
-                    approval_request_id,
-                    vendor_name,
-                    invoice_number,
-                    department_id,
-                    invoice_amount,
-                    scheduled_payment_date,
-                ),
+                "SELECT status FROM approval_requests WHERE id = %s FOR UPDATE;",
+                (approval_request_id,),
             )
+            request_row = cur.fetchone()
+            if request_row is None:
+                raise ValueError("Approval request does not exist.")
+            if str(request_row[0]).upper() != "APPROVED":
+                raise PermissionError(
+                    "A payment schedule can only be created for a fully approved invoice."
+                )
 
-            row = cur.fetchone()
-
-            if row is None:
-                # Row already existed; fetch its id.
+            cur.execute(
+                "SELECT id FROM payment_schedules WHERE approval_request_id = %s FOR UPDATE;",
+                (approval_request_id,),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                payment_id = existing[0]
+            else:
                 cur.execute(
-                    "SELECT id FROM payment_schedules WHERE approval_request_id = %s;",
-                    (approval_request_id,),
+                    """
+                    INSERT INTO payment_schedules
+                    (
+                        approval_request_id, vendor_name, invoice_number,
+                        department_id, invoice_amount, scheduled_payment_date
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        approval_request_id, vendor_name, invoice_number,
+                        department_id, amount, scheduled_payment_date,
+                    ),
                 )
-                row = cur.fetchone()
-
+                inserted = cur.fetchone()
+                if inserted is None:
+                    raise RuntimeError("Payment schedule was not created.")
+                payment_id = inserted[0]
+                created = True
         conn.commit()
-
-        if row is None:
-            raise RuntimeError(
-                "Payment schedule could not be created or located."
-            )
-
-        return row[0]
-
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
         raise
-
     finally:
         conn.close()
+
+    if created:
+        save_log(
+            "system:payment_scheduled",
+            {
+                "payment_id": payment_id,
+                "approval_request_id": approval_request_id,
+                "invoice": invoice_number,
+                "amount": str(amount),
+                "department_id": department_id,
+            },
+        )
+    return payment_id
 
 
 def list_payment_schedules(status=None):
-    """
-    Return payment schedules, ordered by scheduled date then ID.
-
-    If status is provided, only rows with that payment_status are returned.
-    """
-
+    """Return payment schedules, optionally filtered by status."""
     conn = get_connection()
-
     try:
         with conn.cursor() as cur:
-            sql = (
-                "SELECT "
-                + ", ".join(PAYMENT_COLUMNS)
-                + " FROM payment_schedules"
-            )
+            sql = "SELECT " + ", ".join(PAYMENT_COLUMNS) + " FROM payment_schedules"
             params = ()
-
             if status:
                 sql += " WHERE payment_status = %s"
                 params = (status,)
-
             sql += " ORDER BY scheduled_payment_date ASC, id ASC;"
-
             cur.execute(sql, params)
             rows = cur.fetchall()
-
         return [dict(zip(PAYMENT_COLUMNS, row)) for row in rows]
-
     finally:
         conn.close()
 
 
-def mark_payment_paid(payment_id, paid_by, batch_id=None):
-    """
-    Mark a scheduled payment as PAID.
+def _require_payment_operator(actor_role):
+    role = str(actor_role or "").strip().lower()
+    if role not in {"finance_officer", "admin"}:
+        raise PermissionError("Only Finance Officers or Admins can process payments.")
 
-    Returns the invoice_number on success, or None if the row was
-    not found or was already paid/cancelled.
-    """
 
+def mark_payment_paid(payment_id, paid_by, batch_id=None, *, actor_role=None):
+    """Mark a scheduled payment as paid; does not initiate a bank transfer."""
+    _require_payment_operator(actor_role)
     conn = get_connection()
-
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE payment_schedules
-                SET
-                    payment_status = 'PAID',
-                    paid_at = CURRENT_TIMESTAMP,
-                    paid_by = %s,
-                    payment_batch_id = %s
-                WHERE id = %s
-                  AND payment_status = 'SCHEDULED'
+                SET payment_status = 'PAID', paid_at = CURRENT_TIMESTAMP,
+                    paid_by = %s, payment_batch_id = %s
+                WHERE id = %s AND payment_status = 'SCHEDULED'
                 RETURNING invoice_number, approval_request_id;
                 """,
                 (paid_by, batch_id, payment_id),
             )
-
             row = cur.fetchone()
-
         conn.commit()
-
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
         raise
-
     finally:
         conn.close()
 
     if row is None:
         return None
-
     invoice_number, approval_request_id = row
-
     save_log(
         "human:payment_paid",
         {
@@ -813,59 +805,41 @@ def mark_payment_paid(payment_id, paid_by, batch_id=None):
             "batch_id": batch_id,
         },
     )
-
     return invoice_number
 
 
-def cancel_payment(payment_id, cancelled_by):
-    """
-    Cancel a scheduled payment that has not yet been paid.
-
-    Returns the invoice_number on success, or None if not found or
-    already paid/cancelled.
-    """
-
+def cancel_payment(payment_id, cancelled_by, *, actor_role=None):
+    """Cancel a scheduled payment that has not yet been processed."""
+    _require_payment_operator(actor_role)
     conn = get_connection()
-
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE payment_schedules
                 SET payment_status = 'CANCELLED'
-                WHERE id = %s
-                  AND payment_status = 'SCHEDULED'
+                WHERE id = %s AND payment_status = 'SCHEDULED'
                 RETURNING invoice_number;
                 """,
                 (payment_id,),
             )
-
             row = cur.fetchone()
-
         conn.commit()
-
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
         raise
-
     finally:
         conn.close()
 
     if row is None:
         return None
-
     save_log(
         "human:payment_cancelled",
-        {
-            "payment_id": payment_id,
-            "invoice": row[0],
-            "by": cancelled_by,
-        },
+        {"payment_id": payment_id, "invoice": row[0], "by": cancelled_by},
     )
-
     return row[0]
 
 # ==================================================

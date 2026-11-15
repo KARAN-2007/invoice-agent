@@ -19,13 +19,21 @@ from approval_workflow import (
 from agent import run_agent
 from auth import authenticate
 from db_reports import latest_log_id, log_since, recent_log
+
 from db_store import (
+    _auto_create_payment_schedule,
+    acknowledge_vendor_message,
+    cancel_payment,
     decide_request,
-    list_approval_requests,
-    save_log,
-    save_approval_request,
     has_queued_approval_request,
+    list_approval_requests,
+    list_payment_schedules,
+    list_vendor_submissions,
+    mark_payment_paid,
+    save_approval_request,
+    save_log,
 )
+
 from extract_invoice import SUPPORTED_TYPES
 from theme import inject_theme, LOGIN_HERO_HTML, LOGIN_FOOTER_HTML
 from reason_labels import render_reasons, short_reasons
@@ -58,7 +66,7 @@ ROLE_PAGES = {
     "finance_officer": ["Approvals"],
     "final_approver": ["Approvals"],
     "approver": ["Approvals"],  # Existing accounts continue as final approvers.
-    "admin": ["Finance workspace", "Audit log"],
+    "admin": ["Approvals", "Finance workspace", "Audit log"],
 }
 
 st.set_page_config(
@@ -1211,18 +1219,21 @@ def _render_upload_form(user):
 # APPROVALS PAGE
 # ==================================================
 def _render_payment_schedule_tab(user):
+    """Show payment schedules to approvers; restrict actions to finance/admin."""
     st.subheader("Upcoming payments")
-
+    can_process = str(user.get("role", "")).strip().lower() in {
+        "finance_officer", "admin"
+    }
     st.caption(
-        "Approved invoices appear here automatically. Mark them as paid "
-        "when finance processes the bank transfer."
+        "Approved invoices appear here automatically. "
+        + ("Authorised finance users can process or cancel scheduled entries."
+           if can_process else "Read-only view. Payment actions are restricted to Finance Officers and Admins.")
     )
 
     try:
         scheduled = list_payment_schedules("SCHEDULED")
-        paid = [
-            row
-            for row in list_payment_schedules()
+        history = [
+            row for row in list_payment_schedules()
             if row["payment_status"] != "SCHEDULED"
         ]
     except Exception as exc:
@@ -1230,109 +1241,80 @@ def _render_payment_schedule_tab(user):
         st.caption(str(exc)[:200])
         return
 
-    total_scheduled = sum(
-        float(row["invoice_amount"] or 0)
-        for row in scheduled
-    )
-
+    total_scheduled = sum(float(row["invoice_amount"] or 0) for row in scheduled)
     m1, m2, m3 = st.columns(3)
     m1.metric("Awaiting payment", len(scheduled))
     m2.metric("Total scheduled", f"{total_scheduled:,.2f}")
-    m3.metric(
-        "Paid / cancelled",
-        len(paid),
-    )
+    m3.metric("Paid / cancelled", len(history))
 
     if not scheduled:
-        st.success("No payments are waiting to be processed.")
+        st.info("No payments are waiting to be processed.")
     else:
         for row in scheduled:
             payment_id = row["id"]
-
             with st.container(border=True):
                 left, right = st.columns([3, 1])
-
                 with left:
-                    st.markdown(
-                        "### " + str(row["invoice_number"] or "Invoice")
-                    )
+                    st.markdown("### " + str(row["invoice_number"] or "Invoice"))
                     st.caption(
-                        "Vendor: "
-                        + str(row["vendor_name"] or "—")
-                        + " · Department: "
-                        + str(row["department_id"] or "—")
-                        + " · Approval request #"
-                        + str(row["approval_request_id"])
+                        "Vendor: " + str(row["vendor_name"] or "—")
+                        + " · Department: " + str(row["department_id"] or "—")
+                        + " · Approval request #" + str(row["approval_request_id"])
                     )
-
-                    st.write(
-                        "**Amount:** "
-                        + f"{float(row['invoice_amount'] or 0):,.2f}"
-                    )
-                    st.write(
-                        "**Scheduled for:** "
-                        + str(row["scheduled_payment_date"])
-                    )
+                    st.write("**Amount:** " + f"{float(row['invoice_amount'] or 0):,.2f}")
+                    st.write("**Scheduled for:** " + str(row["scheduled_payment_date"]))
 
                 with right:
+                    if not can_process:
+                        st.caption("Finance-only actions")
+                        continue
                     batch_id = st.text_input(
                         "Batch ID (optional)",
                         key="batch_" + str(payment_id),
                         placeholder="e.g. BATCH-2026-11",
                     )
-
                     if st.button(
-                        "Mark as paid",
-                        type="primary",
-                        key="pay_" + str(payment_id),
-                        use_container_width=True,
+                        "Mark as paid", type="primary",
+                        key="pay_" + str(payment_id), use_container_width=True,
                     ):
                         try:
                             result = mark_payment_paid(
                                 payment_id,
                                 paid_by=user["username"],
                                 batch_id=batch_id or None,
+                                actor_role=user.get("role"),
                             )
                             if result:
-                                st.success(
-                                    "Marked as paid: " + str(result)
-                                )
+                                st.success("Marked as paid: " + str(result))
                                 st.rerun()
                             else:
-                                st.warning(
-                                    "This payment was already processed."
-                                )
+                                st.warning("This payment was already processed.")
                         except Exception as exc:
                             st.error("Could not update payment.")
                             st.caption(str(exc)[:200])
 
                     if st.button(
-                        "Cancel",
-                        key="cancel_" + str(payment_id),
+                        "Cancel", key="cancel_" + str(payment_id),
                         use_container_width=True,
                     ):
                         try:
                             result = cancel_payment(
                                 payment_id,
                                 cancelled_by=user["username"],
+                                actor_role=user.get("role"),
                             )
                             if result:
-                                st.info(
-                                    "Payment cancelled: " + str(result)
-                                )
+                                st.info("Payment cancelled: " + str(result))
                                 st.rerun()
                             else:
-                                st.warning(
-                                    "This payment was already processed."
-                                )
+                                st.warning("This payment was already processed.")
                         except Exception as exc:
                             st.error("Could not cancel payment.")
                             st.caption(str(exc)[:200])
 
     st.divider()
     st.markdown("### Payment history")
-
-    if not paid:
+    if not history:
         st.caption("No payments have been processed yet.")
     else:
         st.dataframe(
@@ -1347,14 +1329,15 @@ def _render_payment_schedule_tab(user):
                     "Paid by": row["paid_by"] or "",
                     "Batch": row["payment_batch_id"] or "",
                 }
-                for row in paid
+                for row in history
             ],
             use_container_width=True,
             hide_index=True,
         )
 
+
 def approvals_page(user):
-    allowed_roles = ["department_head", "finance_officer", "final_approver", "approver"]
+    allowed_roles = ["department_head", "finance_officer", "final_approver", "approver", "admin"]
     require_role(user, allowed_roles)
     user_role = str(user.get("role") or "").strip().lower()
     role_label = ROLE_LABELS.get(user_role, user_role.replace("_", " ").title())

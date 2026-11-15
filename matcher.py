@@ -158,43 +158,79 @@ def _match_po_item(item: dict[str, Any], po_items: list[dict[str, Any]]) -> int 
 
 
 def _vendor_findings(invoice: dict[str, Any], po: dict[str, Any]) -> list[dict[str, str]]:
+    """Compare vendor IDs and clean company names, ignoring address blocks."""
     findings: list[dict[str, str]] = []
+
     invoice_vendor_id = _first_value(invoice.get("vendor_id"), invoice.get("vid"))
     po_vendor_id = _first_value(po.get("vendor_id"), po.get("vid"))
     invoice_vendor = _first_value(invoice.get("vendor"), invoice.get("vendor_name"))
     po_vendor = _first_value(po.get("vendor_name"), po.get("vendor"))
 
-    if invoice_vendor_id is not None and po_vendor_id is not None:
-        if _normalise(invoice_vendor_id) != _normalise(po_vendor_id):
+    def clean_vendor_name(value: Any) -> str:
+        if isinstance(value, dict):
+            value = (
+                value.get("name")
+                or value.get("vendor_name")
+                or value.get("supplier_name")
+            )
+        lines = [
+            line.strip()
+            for line in str(value or "").replace("\r", "\n").split("\n")
+            if line.strip()
+        ]
+        # Extractors sometimes append the address, vendor ID and GSTIN
+        # after the company name. The first non-empty line is the name.
+        return _normalise(lines[0]) if lines else ""
+
+    invoice_name = clean_vendor_name(invoice_vendor)
+    po_name = clean_vendor_name(po_vendor)
+    invoice_id = _normalise(invoice_vendor_id)
+    po_id = _normalise(po_vendor_id)
+
+    if invoice_id and po_id:
+        if invoice_id != po_id:
             findings.append({
                 "type": "VENDOR_ID_MISMATCH",
-                "details": f"Invoice vendor ID '{invoice_vendor_id}' does not match PO vendor ID '{po_vendor_id}'.",
+                "details": (
+                    f"Invoice vendor ID '{invoice_vendor_id}' does not match "
+                    f"PO vendor ID '{po_vendor_id}'."
+                ),
             })
-    elif invoice_vendor is not None and po_vendor is not None:
-        if _normalise(invoice_vendor) != _normalise(po_vendor):
-            findings.append({
-                "type": "VENDOR_MISMATCH",
-                "details": f"Invoice vendor '{invoice_vendor}' does not match PO vendor '{po_vendor}'.",
-            })
-    elif invoice_vendor_id is None and invoice_vendor is None:
-        findings.append({
-            "type": "INVOICE_VENDOR_MISSING",
-            "details": "The canonical invoice record does not contain a vendor ID or vendor name.",
-        })
-    elif po_vendor_id is None and po_vendor is None:
-        findings.append({
-            "type": "PO_VENDOR_MISSING",
-            "details": "The purchase order does not contain a vendor ID or vendor name.",
-        })
-
-    # If both names are present, check them independently too. In this app the
-    # invoice vendor ID may be copied from the PO during record creation.
-    if invoice_vendor is not None and po_vendor is not None:
-        if _normalise(invoice_vendor) != _normalise(po_vendor):
+        # Compare names independently as a second identity check.
+        if invoice_name and po_name and invoice_name != po_name:
             findings.append({
                 "type": "VENDOR_NAME_MISMATCH",
-                "details": f"Invoice vendor name '{invoice_vendor}' does not match PO vendor name '{po_vendor}'.",
+                "details": (
+                    f"Invoice vendor name '{invoice_vendor}' does not match "
+                    f"PO vendor name '{po_vendor}'."
+                ),
             })
+    elif invoice_name and po_name:
+        if invoice_name != po_name:
+            findings.append({
+                "type": "VENDOR_MISMATCH",
+                "details": (
+                    f"Invoice vendor '{invoice_vendor}' does not match "
+                    f"PO vendor '{po_vendor}'."
+                ),
+            })
+    elif not invoice_id and not invoice_name:
+        findings.append({
+            "type": "INVOICE_VENDOR_MISSING",
+            "details": (
+                "The canonical invoice record does not contain "
+                "a vendor ID or vendor name."
+            ),
+        })
+    elif not po_id and not po_name:
+        findings.append({
+            "type": "PO_VENDOR_MISSING",
+            "details": (
+                "The purchase order does not contain "
+                "a vendor ID or vendor name."
+            ),
+        })
+
     return findings
 
 

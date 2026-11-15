@@ -124,8 +124,26 @@ def check_line_math(invoice):
 
 
 def _normalize_vendor(value):
-    """Normalize vendor IDs and names for comparison."""
-    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    """Normalize a vendor ID or the company-name part of an extracted value."""
+    import re
+
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+
+def _vendor_company_name(value):
+    """Discard address/GST metadata appended below the extracted company name."""
+    if isinstance(value, dict):
+        value = (
+            value.get("name")
+            or value.get("vendor_name")
+            or value.get("supplier_name")
+        )
+    lines = [
+        line.strip()
+        for line in str(value or "").replace("\r", "\n").split("\n")
+        if line.strip()
+    ]
+    return lines[0] if lines else ""
 
 
 def check_vendor(
@@ -134,56 +152,54 @@ def check_vendor(
     invoice_vendor_id=None,
     po_vendor_id=None
 ):
-    """Compare vendor IDs when available, otherwise compare vendor names."""
+    """Compare explicit vendor IDs first, then clean company names."""
+    invoice_name = _vendor_company_name(invoice_vendor)
+    po_name = _vendor_company_name(po_vendor)
 
-    # 1. If both explicit vendor IDs exist, compare them.
-    if invoice_vendor_id and po_vendor_id:
-        invoice_id = _normalize_vendor(invoice_vendor_id)
-        po_id = _normalize_vendor(po_vendor_id)
+    invoice_id = _normalize_vendor(invoice_vendor_id)
+    po_id = _normalize_vendor(po_vendor_id)
 
-        if invoice_id == po_id:
+    if invoice_id and po_id:
+        if invoice_id != po_id:
             return {
-                "status": "match",
-                "note": f"Vendor ID '{invoice_vendor_id}' matches the PO."
+                "status": "mismatch",
+                "note": (
+                    f"Invoice vendor ID '{invoice_vendor_id}' does not match "
+                    f"PO vendor ID '{po_vendor_id}'."
+                ),
             }
 
+        # Even when IDs match, a clearly different company name should be reviewed.
+        if invoice_name and po_name:
+            if _normalize_vendor(invoice_name) != _normalize_vendor(po_name):
+                return {
+                    "status": "mismatch",
+                    "note": (
+                        f"Invoice vendor name '{invoice_name}' does not match "
+                        f"PO vendor name '{po_name}'."
+                    ),
+                }
+
+        return {
+            "status": "match",
+            "note": f"Vendor ID '{invoice_vendor_id}' matches the PO.",
+        }
+
+    if invoice_name and po_name:
+        if _normalize_vendor(invoice_name) == _normalize_vendor(po_name):
+            return {
+                "status": "match",
+                "note": f"'{invoice_name}' matches '{po_name}'.",
+            }
         return {
             "status": "mismatch",
             "note": (
-                f"Invoice vendor ID '{invoice_vendor_id}' "
-                f"does not match PO vendor ID '{po_vendor_id}'."
-            )
-        }
-
-    # 2. The extracted vendor field might itself contain the vendor ID.
-    if po_vendor_id and _normalize_vendor(invoice_vendor) == _normalize_vendor(po_vendor_id):
-        return {
-            "status": "match",
-            "note": f"Invoice vendor code '{invoice_vendor}' matches the PO vendor ID."
-        }
-
-    # 3. Otherwise compare vendor names.
-    invoice_name = str(invoice_vendor or "").strip()
-    po_name = str(po_vendor or "").strip()
-
-    if not invoice_name or not po_name:
-        return {
-            "status": "cannot_check",
-            "note": "Vendor information is incomplete."
-        }
-
-    a = _normalize_vendor(invoice_name)
-    b = _normalize_vendor(po_name)
-
-    score = difflib.SequenceMatcher(None, a, b).ratio()
-
-    if score >= 0.85:
-        return {
-            "status": "match",
-            "note": f"'{invoice_name}' matches '{po_name}'."
+                f"Invoice vendor '{invoice_name}' does not match "
+                f"PO vendor '{po_name}'."
+            ),
         }
 
     return {
-        "status": "mismatch",
-        "note": f"Invoice says '{invoice_name}' but the PO says '{po_name}'."
+        "status": "cannot_check",
+        "note": "Vendor identity could not be verified because the invoice or PO vendor details are missing.",
     }
