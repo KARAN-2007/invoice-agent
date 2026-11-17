@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from reason_labels import describe_matcher_findings
+
 
 _GRN_MISSING_CODES = {
     "MISSING_GOODS_RECEIPT",
@@ -240,13 +242,14 @@ def build_approval_evidence(file_name: str, audit_rows: list[dict[str, Any]]) ->
     if matching_event is None:
         matching = ("Not recorded", "warning", "No three-way matching event was recorded for this invoice.")
     elif matching_outcome == "NO_DISCREPANCIES_FOUND" and not matching_findings:
-        matching = ("No discrepancies", "passed", "The matcher found no discrepancies. Human approval is still required.")
+        matching = (
+            "No discrepancies",
+            "passed",
+            "Quantities, prices and vendor agree across the PO, goods receipt and invoice. "
+            "Other checks (GST, budget, duplicates) are listed separately.",
+        )
     elif matching_findings or matching_outcome == "DISCREPANCIES_FOUND":
-        finding_details = [
-            str(item.get("type") or "ISSUE") + ": " + str(item.get("details") or "")
-            for item in matching_findings[:5]
-            if isinstance(item, dict)
-        ]
+        finding_details = describe_matcher_findings(matching_findings)
         matching = (
             "Discrepancies found",
             "issue",

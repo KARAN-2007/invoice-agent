@@ -12,29 +12,17 @@ from agent_tools import (
     check_department_budget,
     check_invoice_math,
     check_vendor_matches_po,
+    find_candidate_pos,
     get_dataset_result,
     log_step,
     lookup_po,
     read_invoice,
+    record_plan,
     send_to_human_review,
     start_run,
 )
-
-from agent_tools import (
-    check_dataset_rules,
-    check_department_budget,          # ← add
-    check_invoice_math,
-    check_vendor_matches_po,
-    get_dataset_result,
-    log_step,
-    lookup_po,
-    read_invoice,
-    send_to_human_review,
-    start_run,
-)
-
-from db_store import save_approval_request
 from rules import INFO_ONLY_CODES
+from reason_labels import REASONS, reason_label
 
 
 # ==================================================
@@ -104,31 +92,39 @@ def _safe_log(step, detail):
 # 3. SYSTEM PROMPT
 # ==================================================
 
-SYSTEM_PROMPT = """You are an accounts payable agent for a university. You check one vendor invoice at a time.
+SYSTEM_PROMPT = """You are an accounts payable investigation agent for a university.
+Your goal: gather the evidence a human approver needs to decide on ONE vendor invoice.
+You never approve, reject or pay anything. A human always makes the final decision.
 
-Work through these steps in order:
-1. Call read_invoice to get the invoice data.
-2. Call check_invoice_math to check its arithmetic.
-3. If the invoice has a PO number, call lookup_po with the current file_name and the PO exactly as printed.
-4. If lookup_po finds the PO exactly, call check_vendor_matches_po with the current file_name and the PO number.
-5. Always call check_dataset_rules exactly once.
-6. Treat the recommendation and findings from check_dataset_rules as authoritative.
-6a. Call check_department_budget with the exact invoice filename.
-
-    If the invoice total exceeds the remaining budget of the
-    department that owns the matching purchase order, note this
-    finding. Do not invent a budget or a department.
-7. If the dataset recommendation is NEEDS_HUMAN_REVIEW, report all returned reason codes.
-8. Do not approve, reject, pay, or route the invoice yourself. The Python program applies the final human-review routing after the checks are complete.
-9. If the only finding is PRICE_VARIANCE_WITHIN_TOLERANCE, do not describe it as a blocking issue.
+How to work:
+1. First call record_plan with the file name, the checks you intend to run, and why.
+2. Execute your plan one tool at a time. After each result, decide what to do next.
+   If a result changes what you need to check, call record_plan again with the
+   revised plan and the reason for the change.
+3. Evidence you must always gather: read_invoice, check_invoice_math,
+   check_department_budget (with the exact invoice file name), and
+   check_dataset_rules (exactly once).
+4. If the invoice shows a PO number, call lookup_po with the current file_name and
+   the PO exactly as printed. If lookup_po finds it exactly, call
+   check_vendor_matches_po with that PO.
+5. If the invoice has no PO number, or lookup_po does not find it exactly, call
+   find_candidate_pos to look for likely purchase orders from the same vendor.
+   Report the candidates only as suggestions for a human to confirm. Never treat a
+   candidate as the invoice's PO and never call check_vendor_matches_po with one.
+6. If a tool returns an error, you may call it once more. If it fails again, note
+   it and continue with the remaining checks.
 
 Rules:
-- Never invent or correct a PO number, vendor or amount.
-- Never replace the deterministic dataset recommendation with your own judgement.
-- You cannot approve or pay anything. A human always makes the final approval decision.
-- Call each tool at most once, unless it returned an error.
-- Always call check_department_budget once, even if the PO was not found.
-- Finish with a short summary. The final program will determine the recommendation from the dataset rules.
+- Never invent or correct a PO number, vendor, budget, department or amount.
+- Treat the recommendation and findings from check_dataset_rules as authoritative.
+  Never replace them with your own judgement.
+- If the dataset recommendation is NEEDS_HUMAN_REVIEW, report all returned reason codes.
+- If the only finding is PRICE_VARIANCE_WITHIN_TOLERANCE, do not describe it as blocking.
+- Do not call send_to_human_review yourself unless a check fails; the program applies
+  the final routing after your checks.
+
+Finish with a short summary in this order: Plan (and any revision with its reason),
+Findings, Candidate POs (if any, clearly marked as unconfirmed suggestions).
 """
 
 
@@ -137,6 +133,7 @@ def _ensure_required_tool_checks(file_name):
     results = {}
     skipped = []
     failures = {}
+    need_candidates = False
 
     # Repeated calls are safe: most tools cache their per-invoice result.
     # This guard ensures a short Gemini response cannot bypass AP controls.
@@ -200,10 +197,20 @@ def _ensure_required_tool_checks(file_name):
             skipped.append(
                 "check_vendor_matches_po: PO was not found exactly; manual confirmation is required."
             )
+            need_candidates = True
     else:
         skipped.append(
             "lookup_po and check_vendor_matches_po: no PO number was extracted."
         )
+        need_candidates = True
+
+    # Recovery path: suggest likely POs for a human to confirm. Cached, so this
+    # does not repeat a call Gemini already made. Never changes the decision.
+    if need_candidates and not failures.get("read_invoice"):
+        try:
+            results["find_candidate_pos"] = find_candidate_pos(file_name)
+        except Exception as exc:
+            failures["find_candidate_pos"] = str(exc)[:180]
 
     try:
         results["check_dataset_rules"] = check_dataset_rules(file_name)
@@ -249,11 +256,67 @@ def _ensure_required_tool_checks(file_name):
 # 4. RECORD FINAL OUTCOME
 # ==================================================
 
+def _grounded_summary(
+    summary, recommendation, reason_codes, extra_note=None, candidates=None
+):
+    """Append findings built in Python from the rules engine to Gemini's text.
+
+    Approvers should never have to rely on the model's retelling of codes:
+    this block is generated deterministically from the same codes that drive
+    the recommendation.
+    """
+
+    lines = ["", "---", "**Verified findings (rules engine, not AI-generated)**"]
+    if recommendation == "READY_FOR_APPROVAL":
+        lines.append("- Recommendation: ready for human approval")
+    else:
+        lines.append("- Recommendation: human review required")
+
+    blocking = [code for code in reason_codes if code not in INFO_ONLY_CODES]
+    info_only = [code for code in reason_codes if code in INFO_ONLY_CODES]
+
+    for code in blocking + info_only:
+        explanation = REASONS.get(code, (None, None, ""))[2]
+        line = "- " + reason_label(code) + " (" + code + ")"
+        if explanation:
+            line += ": " + explanation
+        lines.append(line)
+
+    if not reason_codes:
+        lines.append("- No blocking findings.")
+
+    # PO recovery: shown whether or not the model mentioned it, so the
+    # approver always sees the suggestions. They never affect the decision.
+    if isinstance(candidates, dict):
+        found = [c for c in candidates.get("candidates") or [] if isinstance(c, dict)]
+        if found:
+            lines.append(
+                "- Possible purchase orders to confirm (suggestions only, not used "
+                "for the decision): "
+                + "; ".join(
+                    str(c.get("po_number")) + " (" + str(c.get("why") or "") + ")"
+                    for c in found
+                )
+            )
+        elif candidates.get("status") == "no_candidates":
+            lines.append("- No purchase orders from this vendor were found to suggest.")
+
+    if extra_note:
+        lines.append("- Note: " + str(extra_note)[:300])
+
+    base = str(summary or "").rstrip()
+    return (base + "\n" if base else "") + "\n".join(lines)
+
+
 def record_outcome(file_name, summary, force_human_review_reason=None):
     """Save a fail-safe recommendation based on deterministic dataset rules."""
     # Gemini may return a text response after calling only one tool. Complete
     # every required validation before creating the approval recommendation.
-    _ensure_required_tool_checks(file_name)
+    try:
+        check_results = _ensure_required_tool_checks(file_name) or {}
+    except Exception as exc:
+        check_results = {}
+        _safe_log("agent:required_checks_error", {"file": file_name, "error": str(exc)[:200]})
 
     try:
         dataset_result = get_dataset_result(file_name)
@@ -338,6 +401,14 @@ def record_outcome(file_name, summary, force_human_review_reason=None):
         },
     )
 
+    summary = _grounded_summary(
+        summary,
+        recommendation,
+        reason_codes,
+        extra_note,
+        candidates=check_results.get("find_candidate_pos"),
+    )
+
     # Save outside the Gemini retry loop. A database failure must never
     # restart Gemini or repeat completed invoice checks.
     try:
@@ -419,6 +490,15 @@ _VENDOR_MESSAGE_TEMPLATES = {
         "recorded as received. Please re-upload with the correct "
         "quantities, or contact the receiving department.",
 
+    "CUMULATIVE_PO_OVERBILL":
+        "The quantity on your invoice is more than the purchase order "
+        "allows (including any earlier invoices against it). Please "
+        "re-upload with the correct quantity, or contact procurement.",
+
+    "GST_RATE_MISMATCH":
+        "The GST rate on your invoice does not match the rate on the "
+        "purchase order. Please re-upload a corrected invoice.",
+
     "MISSING_GOODS_RECEIPT":
         "We have no goods receipt on record for this purchase order. "
         "Please contact the receiving department before re-submitting.",
@@ -479,16 +559,29 @@ def run_agent(file_name):
             ),
         )
 
+    # Planning adds tool calls; raise the SDK's default limit of 10 so a
+    # re-plan does not cut the run short. Skipped safely on older SDKs.
+    extra_config = {}
+    try:
+        extra_config["automatic_function_calling"] = (
+            types.AutomaticFunctionCallingConfig(maximum_remote_calls=20)
+        )
+    except Exception:
+        extra_config = {}
+
     try:
         config = types.GenerateContentConfig(
+            **extra_config,
             system_instruction=SYSTEM_PROMPT,
             temperature=0,
             tools=[
+                record_plan,
                 read_invoice,
                 check_invoice_math,
                 lookup_po,
                 check_vendor_matches_po,
-                check_department_budget,          # ← add
+                find_candidate_pos,
+                check_department_budget,
                 check_dataset_rules,
                 send_to_human_review,
             ],

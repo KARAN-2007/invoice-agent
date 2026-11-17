@@ -2,9 +2,108 @@ import csv
 import hashlib
 import io
 import json
+import time
 from pathlib import Path
 
 import streamlit as st
+
+
+def _reload_changed_project_modules():
+    """Load again any project module whose .py file changed since it was imported.
+
+    Streamlit re-runs app.py on every interaction but keeps imported modules
+    in memory, and its file watcher can miss changes in OneDrive-synced
+    folders. Without this, an edited page (e.g. finance_pages.py) keeps
+    showing the old version until the server is restarted.
+
+    A module is out of date when its source file's modification time differs
+    from the one recorded in its compiled .pyc when it was imported.
+    """
+    import importlib
+    import sys
+
+    here = Path(__file__).resolve().parent
+    stale = []
+
+    for name, module in list(sys.modules.items()):
+        source = getattr(module, "__file__", None)
+        cached = getattr(module, "__cached__", None)
+        if not source or not cached or not str(source).endswith(".py"):
+            continue
+        try:
+            source_path = Path(source).resolve()
+            if source_path.parent != here or source_path.name == "app.py":
+                continue
+            with open(cached, "rb") as handle:
+                header = handle.read(16)
+            # .pyc header: magic, flags, source mtime, source size.
+            if len(header) < 16 or int.from_bytes(header[4:8], "little") != 0:
+                continue
+            recorded = int.from_bytes(header[8:12], "little")
+            current = int(source_path.stat().st_mtime) & 0xFFFFFFFF
+        except OSError:
+            continue
+        if recorded != current:
+            stale.append(name)
+
+    if not stale:
+        return
+
+    def project_modules():
+        for name, module in list(sys.modules.items()):
+            if name == "__main__" or not getattr(module, "__file__", None):
+                continue
+            try:
+                if Path(module.__file__).resolve().parent == here:
+                    yield name, module
+            except OSError:
+                continue
+
+    def uses(module, names):
+        """Does this module hold objects copied from any of these modules?"""
+        for value in list(vars(module).values()):
+            origin = getattr(value, "__module__", None) or getattr(value, "__name__", None)
+            if origin in names:
+                return True
+        return False
+
+    # Reload the changed files first, then (level by level) the modules that
+    # copied names from them ("from theme import x"), so every module picks
+    # up the new objects.
+    done = set()
+    level = stale
+    while level:
+        for name in level:
+            try:
+                importlib.reload(sys.modules[name])
+            except Exception as exc:  # keep the app usable; report in the log
+                print("Could not reload", name, "-", str(exc)[:200])
+            done.add(name)
+        level = [
+            name for name, module in project_modules()
+            if name not in done and name != "app" and uses(module, set(level))
+        ]
+
+
+_reload_changed_project_modules()
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    # The project's packages live in .venv. This happens when the app is
+    # started with a different Python (e.g. plain `streamlit run app.py`).
+    st.error(
+        "This app was started with a Python that does not have the project's "
+        "packages installed. Close this window and start the app by "
+        "double-clicking run_app.bat (or reset_and_start_demo.bat), which "
+        "uses the project's .venv. From a terminal: "
+        r".venv\Scripts\python.exe -m streamlit run app.py"
+    )
+    st.stop()
+
+# Load .env on every run so settings added after the app started
+# (database password, API key) are picked up without a restart.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from po_pages import render_po_page
 from grn_pages import render_grn_page
@@ -17,32 +116,54 @@ from approval_workflow import (
     role_can_act,
 )
 from agent import run_agent
-from auth import authenticate
+from auth import login
 from db_reports import latest_log_id, log_since, recent_log
 
 from db_store import (
     _auto_create_payment_schedule,
     acknowledge_vendor_message,
+    can_pay_through_gateway,
     cancel_payment,
     decide_request,
+    get_payment_schedule,
     has_queued_approval_request,
     list_approval_requests,
     list_payment_schedules,
     list_vendor_submissions,
+    log_gateway_failure,
     mark_payment_paid,
+    record_gateway_payment,
     save_approval_request,
     save_log,
 )
+import payment_gateway as pgw
 
 
 from extract_invoice import SUPPORTED_TYPES
-from theme import inject_theme, LOGIN_HERO_HTML, LOGIN_FOOTER_HTML
-from reason_labels import render_reasons, short_reasons
+
+
+from theme import (
+    LOGIN_FOOTER_HTML,
+    LOGIN_HERO_HTML,
+    amount_tile_html,
+    inject_theme,
+    sidebar_nav_item_html,
+    sidebar_profile_html,
+)
+from reason_labels import (
+    describe_matcher_findings,
+    reason_label,
+    render_reasons,
+    short_reasons,
+)
 from record_store import (
     RecordStoreError,
     normalize_po_id,
     save_invoice,
 )
+
+# Sign a person out after this long without any activity in the app.
+SESSION_IDLE_MINUTES = 30
 
 INVOICE_DIR = Path(__file__).parent / "invoices"
 EXTRACTED_DIR = Path(__file__).parent / "data" / "invoices"
@@ -51,7 +172,7 @@ ROLE_PAGES = {
     "vendor": ["Upload invoice"],
     "procurement_officer": ["Purchase Orders", "Goods Receipts"],
     "department_head": ["Approvals"],
-    "finance_officer": ["Approvals"],
+    "finance_officer": ["Approvals", "Finance workspace"],
     "final_approver": ["Approvals"],
     "approver": ["Approvals"],  # Existing accounts continue as final approvers.
     "admin": ["Approvals", "Finance workspace", "Audit log"],
@@ -366,6 +487,23 @@ def describe_step(step, detail):
             return "Three-way matching found " + str(len(findings)) + " discrepancy/discrepancies."
         return "Three-way matching result: " + (matching_result or "inconclusive") + "."
 
+    if step in ("agent:plan", "agent:plan_revised"):
+        steps_text = "; ".join(str(item) for item in (detail.get("steps") or [])[:6])
+        label = "Agent planned" if step == "agent:plan" else "Agent revised its plan"
+        reasoning = str(detail.get("reasoning") or "").strip()
+        return (
+            label + ": " + (steps_text or "no steps recorded") + "."
+            + (" Why: " + reasoning if reasoning else "")
+        )
+    if step == "tool:find_candidate_pos":
+        candidates = [c for c in result.get("candidates") or [] if isinstance(c, dict)]
+        if candidates:
+            return (
+                "Searched for likely purchase orders from the same vendor: "
+                + ", ".join(str(c.get("po_number")) for c in candidates)
+                + " (suggestions for a human to confirm)."
+            )
+        return "Searched for likely purchase orders; none from this vendor were found."
     if step == "tool:send_to_human_review":
         return "Sent to human review: " + str(detail.get("reason", ""))
     if step == "agent:error":
@@ -550,14 +688,11 @@ def build_verification_checks(file_name, steps, result, request_record=None):
         if matching_outcome == "NO_DISCREPANCIES_FOUND" and not matching_findings:
             checks.append(make_check(
                 "Three-way matching", "passed",
-                "No PO / GRN / invoice discrepancies were found. Human approval is still required.",
+                "Quantities, prices and vendor agree across the PO, goods receipt and invoice. "
+                "Other checks (GST, budget, duplicates) are reported separately.",
             ))
         elif matching_findings or matching_outcome == "DISCREPANCIES_FOUND":
-            finding_text = " | ".join(
-                str(item.get("type", "ISSUE")) + ": " + str(item.get("details", ""))
-                for item in matching_findings[:5]
-                if isinstance(item, dict)
-            )
+            finding_text = " | ".join(describe_matcher_findings(matching_findings))
             checks.append(make_check(
                 "Three-way matching", "review",
                 "The matcher found discrepancies that require human review.",
@@ -729,32 +864,79 @@ def create_audit_csv(rows):
 # LOGIN PAGE
 # ==================================================
 
+def _wait_text(seconds):
+    """'about 2 minutes' / 'about 40 seconds' for a lockout message."""
+
+    seconds = max(1, int(seconds))
+    if seconds >= 90:
+        return "about " + str(round(seconds / 60)) + " minutes"
+    if seconds >= 50:
+        return "about a minute"
+    return "about " + str(seconds) + " seconds"
+
+
 def login_screen():
-    left, right = st.columns([1.2, 0.85], gap="large")
+    left, right = st.columns([1.15, 0.85], gap="large")
     with left:
         st.html(LOGIN_HERO_HTML)
     with right:
-        st.markdown("<div class='login-label'>Account access</div>", unsafe_allow_html=True)
-        st.markdown("## Welcome back")
-        st.caption("Sign in to access your invoice workspace.")
+        st.markdown("## Sign in")
+        st.caption("Use your invoice workspace account.")
+
+        # One-time message, e.g. after signing out or an idle sign-out.
+        notice = st.session_state.pop("login_notice", None)
+        if notice:
+            st.info(notice)
 
         with st.form("login_form"):
-            username = st.text_input("Username", placeholder="Enter your username")
-            password = st.text_input("Password", type="password", placeholder="Enter your password")
-            submitted = st.form_submit_button("Sign in →", type="primary", use_container_width=True)
+            username = st.text_input(
+                "Username",
+                placeholder="Enter your username",
+                max_chars=64,
+                autocomplete="username",
+            )
+            password = st.text_input(
+                "Password",
+                type="password",
+                placeholder="Enter your password",
+                max_chars=256,
+                autocomplete="current-password",
+            )
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
 
         if submitted:
             try:
-                user = authenticate(username, password)
+                outcome = login(username, password)
             except Exception as exc:
                 st.error("Could not reach the database. Check that PostgreSQL is running and that .env is correct.")
                 st.caption(str(exc)[:200])
                 return
-            if user:
-                st.session_state["user"] = user
+
+            status = outcome.get("status")
+
+            if status == "ok":
+                # Start from a clean session so nothing from a previous
+                # person's session carries over on a shared computer.
+                st.session_state.clear()
+                st.session_state["user"] = outcome["user"]
+                st.session_state["last_active"] = time.time()
                 st.rerun()
+            elif status == "missing":
+                st.warning("Enter both your username and your password.")
+            elif status == "locked":
+                st.error(
+                    "Too many wrong attempts. Sign-in for this username is paused. "
+                    "Try again in " + _wait_text(outcome.get("retry_after", 0)) + "."
+                )
             else:
                 st.error("Wrong username or password. Passwords are case-sensitive, so check Caps Lock.")
+                attempts_left = outcome.get("attempts_left")
+                if isinstance(attempts_left, int) and attempts_left <= 2:
+                    st.caption(
+                        str(attempts_left)
+                        + (" attempt" if attempts_left == 1 else " attempts")
+                        + " left before sign-in is paused for a short time."
+                    )
 
         st.html(LOGIN_FOOTER_HTML)
         st.caption("Demo accounts are listed in the README. Passwords are case-sensitive.")
@@ -1070,19 +1252,31 @@ def _render_upload_form(user):
 
             matching_outcome = str(matching_report.get("matching_result") or "").upper()
             discrepancies = matching_report.get("discrepancies") or []
+            final_recommendation = str(result.get("recommendation") or "").upper()
+            other_findings = [
+                code for code in (result.get("findings") or [])
+                if code != "PRICE_VARIANCE_WITHIN_TOLERANCE"
+            ]
             if matching_outcome == "NO_DISCREPANCIES_FOUND" and not discrepancies:
-                st.success("Three-way matching found no discrepancies. Human approval is still required.")
+                if final_recommendation == "NEEDS_HUMAN_REVIEW":
+                    # The PO/GRN/invoice match is clean, but other checks
+                    # (GST, budget, duplicates...) still flag the invoice.
+                    st.info(
+                        "Three-way match: quantities, prices and vendor agree across the "
+                        "PO, goods receipt and invoice. Other checks still need human review: "
+                        + (", ".join(reason_label(code) for code in other_findings)
+                           or "see the findings below")
+                        + "."
+                    )
+                else:
+                    st.success("Three-way matching found no discrepancies. Human approval is still required.")
             else:
                 st.warning(
                     "Three-way matching requires human review: "
                     + str(len(discrepancies)) + " finding(s)."
                 )
-                for finding in discrepancies:
-                    if isinstance(finding, dict):
-                        st.caption(
-                            str(finding.get("type") or "ISSUE") + ": "
-                            + str(finding.get("details") or "")
-                        )
+                for line in describe_matcher_findings(discrepancies, limit=10):
+                    st.caption(line)
 
             # Refresh the run evidence so the upload report includes matching.
             try:
@@ -1129,7 +1323,8 @@ def _render_payment_schedule_tab(user):
     st.caption(
         "Approved invoices appear here automatically. "
         + ("Authorised finance users can process or cancel scheduled entries."
-           if can_process else "Read-only view. Payment actions are restricted to Finance Officers and Admins.")
+           if can_process else "Final Approvers can pay invoices they approved through the payment gateway. "
+           "Other payment actions are restricted to Finance Officers and Admins.")
     )
 
     try:
@@ -1145,9 +1340,13 @@ def _render_payment_schedule_tab(user):
 
     total_scheduled = sum(float(row["invoice_amount"] or 0) for row in scheduled)
     m1, m2, m3 = st.columns(3)
-    m1.metric("Awaiting payment", len(scheduled))
-    m2.metric("Total scheduled", f"{total_scheduled:,.2f}")
-    m3.metric("Paid / cancelled", len(history))
+    # Same tiles as the finance workspace: amounts never hide behind "…".
+    for column, label, value in (
+        (m1, "Awaiting payment", len(scheduled)),
+        (m2, "Total scheduled", f"{total_scheduled:,.2f}"),
+        (m3, "Paid / cancelled", len(history)),
+    ):
+        column.markdown(amount_tile_html(label, value), unsafe_allow_html=True)
 
     if not scheduled:
         st.info("No payments are waiting to be processed.")
@@ -1167,8 +1366,22 @@ def _render_payment_schedule_tab(user):
                     st.write("**Scheduled for:** " + str(row["scheduled_payment_date"]))
 
                 with right:
+                    try:
+                        can_gateway_pay = can_pay_through_gateway(
+                            row, user.get("username"), user.get("role")
+                        )
+                    except Exception:
+                        can_gateway_pay = False
+                    if can_gateway_pay and st.button(
+                        "Pay now", type="primary",
+                        key="gateway_" + str(payment_id), use_container_width=True,
+                    ):
+                        st.session_state["payment_window"] = {"payment_id": payment_id}
+                        st.rerun()
+
                     if not can_process:
-                        st.caption("Finance-only actions")
+                        if not can_gateway_pay:
+                            st.caption("Finance-only actions")
                         continue
                     batch_id = st.text_input(
                         "Batch ID (optional)",
@@ -1176,7 +1389,7 @@ def _render_payment_schedule_tab(user):
                         placeholder="e.g. BATCH-2026-11",
                     )
                     if st.button(
-                        "Mark as paid", type="primary",
+                        "Mark as paid (offline)",
                         key="pay_" + str(payment_id), use_container_width=True,
                     ):
                         try:
@@ -1262,7 +1475,8 @@ def _confirm_decision_dialog(
         st.info(
             "Approving this stage advances the invoice to the next "
             "approval stage. If this is the final stage, the invoice "
-            "is fully approved and a payment schedule is created."
+            "is fully approved, a payment schedule is created and the "
+            "payment window opens."
         )
     else:
         st.warning(
@@ -1290,10 +1504,13 @@ def _confirm_decision_dialog(
                     + str(file_name)
                 )
                 try:
-                    _auto_create_payment_schedule(
+                    payment_id = _auto_create_payment_schedule(
                         approval_request_id=request_id,
                         invoice_number=file_name,
                     )
+                    # Open the payment gateway window for the final approver.
+                    st.session_state["payment_window"] = {"payment_id": payment_id}
+                    message += ". Payment schedule #" + str(payment_id) + " created."
                 except Exception as pay_exc:
                     message += (
                         " WARNING: payment schedule could not be created: "
@@ -1334,6 +1551,205 @@ def _confirm_decision_dialog(
         st.session_state.pop("pending_decision", None)
         st.rerun()
 
+def _inr(value):
+    try:
+        return "₹" + f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "₹—"
+
+
+def _clear_gateway_state(payment_id):
+    for key in ("pgw_order_", "pgw_result_"):
+        st.session_state.pop(key + str(payment_id), None)
+
+
+@st.dialog("Payment gateway", width="large")
+def _payment_gateway_dialog(payment_id, user):
+    """Sandbox checkout window opened after an invoice is fully approved."""
+    order_key = "pgw_order_" + str(payment_id)
+    result_key = "pgw_result_" + str(payment_id)
+    username = user.get("username")
+    user_role = str(user.get("role") or "").strip().lower()
+
+    try:
+        payment = get_payment_schedule(payment_id)
+    except Exception as exc:
+        st.error("Could not load the payment schedule.")
+        st.caption(str(exc)[:200])
+        return
+    if payment is None:
+        st.error("Payment schedule #" + str(payment_id) + " was not found.")
+        return
+
+    st.markdown(
+        "<div style='display:flex;justify-content:space-between;align-items:center;'>"
+        "<div><b style='font-size:1.15rem;'>🔒 " + pgw.GATEWAY_NAME + "</b><br>"
+        "<small>Merchant: University Accounts Payable</small></div>"
+        "<div style='text-align:right;'><small>Amount payable</small><br>"
+        "<b style='font-size:1.6rem;'>" + _inr(payment["invoice_amount"]) + "</b></div></div>",
+        unsafe_allow_html=True,
+    )
+    st.warning(pgw.SANDBOX_NOTICE, icon="🧪")
+
+    info1, info2, info3 = st.columns(3)
+    info1.markdown("**Payee (vendor)**  \n" + str(payment["vendor_name"] or "—"))
+    info2.markdown("**Invoice**  \n" + str(payment["invoice_number"] or "—"))
+    info3.markdown(
+        "**Department · Request**  \n"
+        + str(payment["department_id"] or "—") + " · #" + str(payment["approval_request_id"])
+    )
+    st.divider()
+
+    result = st.session_state.get(result_key)
+
+    # ---------- Result screens ----------
+    if result and result.get("status") == "SUCCESS":
+        st.success("Payment successful", icon="✅")
+        st.markdown(
+            "**Transaction ID:** `" + str(result["transaction_id"]) + "`  \n"
+            "**Order ID:** `" + str(result["order_id"]) + "`  \n"
+            "**Amount:** " + _inr(result["amount"]) + "  \n"
+            "**Paid with:** " + str(result["method_display"]) + "  \n"
+            "**Processed at (UTC):** " + str(result["processed_at"]) + "  \n"
+            "**Paid by:** " + str(username)
+        )
+        st.caption("The payment schedule is now marked PAID and the transaction is in the audit log.")
+        if st.button("Done", type="primary", use_container_width=True, key="pgw_done_" + str(payment_id)):
+            st.session_state["message"] = (
+                "Payment of " + _inr(result["amount"]) + " completed for "
+                + str(payment["invoice_number"]) + ". Transaction " + str(result["transaction_id"]) + "."
+            )
+            _clear_gateway_state(payment_id)
+            st.rerun()
+        return
+
+    if result and result.get("status") == "FAILED":
+        st.error("Payment failed: " + str(result.get("failure_reason") or "Unknown reason."), icon="❌")
+        st.caption("Nothing was charged. The invoice stays in the payment schedule as SCHEDULED.")
+        retry_col, close_col = st.columns(2)
+        if retry_col.button("Try again", type="primary", use_container_width=True, key="pgw_retry_" + str(payment_id)):
+            st.session_state.pop(result_key, None)
+            st.session_state.pop(order_key, None)
+            st.rerun(scope="fragment")
+        if close_col.button("Close", use_container_width=True, key="pgw_close_failed_" + str(payment_id)):
+            _clear_gateway_state(payment_id)
+            st.rerun()
+        return
+
+    # ---------- Checkout form ----------
+    if str(payment["payment_status"] or "").upper() != "SCHEDULED":
+        st.info(
+            "This payment is already " + str(payment["payment_status"])
+            + (". Reference: " + str(payment["payment_batch_id"]) if payment.get("payment_batch_id") else ".")
+        )
+        return
+
+    try:
+        allowed = can_pay_through_gateway(payment, username, user_role)
+    except Exception as exc:
+        st.error("Could not verify payment permission.")
+        st.caption(str(exc)[:200])
+        return
+    if not allowed:
+        st.info(
+            "Only the Final Approver who approved this invoice, a Finance Officer "
+            "or an Admin can pay it."
+        )
+        return
+
+    if order_key not in st.session_state:
+        try:
+            st.session_state[order_key] = pgw.create_order(payment)
+        except pgw.PaymentValidationError as exc:
+            st.error(str(exc))
+            return
+    order = st.session_state[order_key]
+    st.caption("Order " + order["order_id"])
+
+    method = st.radio(
+        "Pay using",
+        pgw.METHODS,
+        format_func=lambda m: pgw.METHOD_LABELS[m],
+        horizontal=True,
+        key="pgw_method_" + str(payment_id),
+    )
+
+    details = {}
+    if method == "UPI":
+        details["vpa"] = st.text_input(
+            "UPI ID", placeholder="name@bank", key="pgw_vpa_" + str(payment_id)
+        )
+    elif method == "CARD":
+        details["card_number"] = st.text_input(
+            "Card number", placeholder="4111 1111 1111 1111",
+            max_chars=23, key="pgw_card_" + str(payment_id),
+        )
+        details["name_on_card"] = st.text_input(
+            "Name on card", key="pgw_name_" + str(payment_id)
+        )
+        exp_col, cvv_col = st.columns(2)
+        details["expiry"] = exp_col.text_input(
+            "Expiry (MM/YY)", placeholder="12/30", max_chars=7, key="pgw_exp_" + str(payment_id)
+        )
+        details["cvv"] = cvv_col.text_input(
+            "CVV", type="password", max_chars=4, key="pgw_cvv_" + str(payment_id)
+        )
+    else:
+        details["bank"] = st.selectbox(
+            "Choose your bank", pgw.NETBANKING_BANKS, key="pgw_bank_" + str(payment_id)
+        )
+
+    with st.expander("Sandbox test credentials"):
+        st.markdown(
+            "- Card **4111 1111 1111 1111**, any future expiry, any CVV → success  \n"
+            "- Card **4000 0000 0000 0002** → declined  \n"
+            "- UPI **success@sandbox** → success · **failure@sandbox** → declined  \n"
+            "- Net banking **Sandbox Bank (decline)** → declined"
+        )
+
+    pay_col, cancel_col = st.columns([2, 1])
+    if pay_col.button(
+        "Pay " + _inr(order["amount"]), type="primary",
+        use_container_width=True, key="pgw_pay_" + str(payment_id),
+    ):
+        try:
+            with st.spinner("Contacting " + pgw.GATEWAY_NAME + "..."):
+                time.sleep(1.2)
+                outcome = pgw.charge(order, method, details)
+        except pgw.PaymentValidationError as exc:
+            st.error(str(exc))
+            return
+
+        if outcome["status"] == "SUCCESS":
+            try:
+                recorded = record_gateway_payment(
+                    payment_id, outcome, username, actor_role=user_role
+                )
+            except Exception as exc:
+                st.error("The gateway approved the charge, but it could not be recorded.")
+                st.caption(str(exc)[:200])
+                return
+            if recorded is None:
+                st.warning("This payment was already processed by someone else.")
+                return
+        else:
+            try:
+                log_gateway_failure(payment_id, outcome, username)
+            except Exception:
+                pass
+
+        st.session_state[result_key] = outcome
+        st.rerun(scope="fragment")
+
+    if cancel_col.button("Pay later", use_container_width=True, key="pgw_later_" + str(payment_id)):
+        _clear_gateway_state(payment_id)
+        st.session_state["message"] = (
+            "Payment window closed. " + str(payment["invoice_number"])
+            + " stays in the Payment schedule tab until it is paid."
+        )
+        st.rerun()
+
+
 def approvals_page(user):
     allowed_roles = ["department_head", "finance_officer", "final_approver", "approver", "admin"]
     require_role(user, allowed_roles)
@@ -1353,7 +1769,12 @@ def approvals_page(user):
     pending = st.session_state.get("pending_decision")
     if pending:
         _confirm_decision_dialog(**pending)
-    
+    elif st.session_state.get("payment_window"):
+        # Pop first so closing the window with X does not reopen it.
+        # Interactions inside the dialog rerun only the dialog itself.
+        window = st.session_state.pop("payment_window")
+        _payment_gateway_dialog(window["payment_id"], user)
+
     try:
         all_pending = list_approval_requests("PENDING")
         decided = [row for row in list_approval_requests() if row["status"] != "PENDING"]
@@ -1664,39 +2085,58 @@ def audit_page(user):
 # ==================================================
 
 user = st.session_state.get("user")
+
+# Idle sign-out: every interaction reruns this script, so the time of the
+# previous run tells us how long the person has been away.
+if user is not None:
+    _now = time.time()
+    _last_active = st.session_state.get("last_active")
+    if (
+        isinstance(_last_active, (int, float))
+        and _now - _last_active > SESSION_IDLE_MINUTES * 60
+    ):
+        try:
+            save_log("auth:session_expired", {"user": user.get("username")})
+        except Exception:
+            pass
+        st.session_state.clear()
+        st.session_state["login_notice"] = (
+            "You were signed out after "
+            + str(SESSION_IDLE_MINUTES)
+            + " minutes without activity. Sign in again to continue."
+        )
+        user = None
+    else:
+        st.session_state["last_active"] = _now
+
 if user is None:
     login_screen()
     st.stop()
 
-st.sidebar.markdown("## 🧾 Invoice agent")
-st.sidebar.caption("Smart invoice management")
-st.sidebar.divider()
-st.sidebar.markdown("**Current workspace**")
+st.sidebar.markdown(
+    sidebar_profile_html(user["full_name"], user["role"]),
+    unsafe_allow_html=True,
+)
 
 available_pages = ROLE_PAGES[user["role"]]
 if len(available_pages) > 1:
-    page = st.sidebar.selectbox("Select workspace", available_pages, key="admin_workspace")
+    page = st.sidebar.radio(
+        "Workspace",
+        available_pages,
+        key="admin_workspace",
+        label_visibility="collapsed",
+    )
 else:
     page = available_pages[0]
+    st.sidebar.markdown(sidebar_nav_item_html(page), unsafe_allow_html=True)
 
-sidebar_page_html = (
-    '<div style="background:rgba(255,255,255,0.10);'
-    'border-left:4px solid #8F95FF;'
-    'padding:13px;border-radius:8px;'
-    'color:#FFFFFF;font-weight:600;">'
-    + page
-    + '</div>'
-)
-st.sidebar.markdown(sidebar_page_html, unsafe_allow_html=True)
-st.sidebar.write("")
-st.sidebar.markdown("**Your account**")
-st.sidebar.markdown(user["full_name"])
-st.sidebar.caption(user["role"].capitalize())
 st.sidebar.divider()
 
 if st.sidebar.button("Log out", use_container_width=True):
     save_log("auth:logout", {"user": user["username"]})
-    st.session_state.pop("user", None)
+    # Clear everything, not just the user, so no state is left behind.
+    st.session_state.clear()
+    st.session_state["login_notice"] = "You have signed out."
     st.rerun()
 
 if page == "Upload invoice":

@@ -17,6 +17,9 @@ Thumbs.db
 
 # Temporary backup
 .gitignore_backup
+*.bak
+*.bak[0-9]*
+_removed_before_submission/
 
 # IDE
 .vscode/
@@ -29,3 +32,6 @@ agent_log.jsonl
 
 invoices/upload_*
 extracted/upload_*
+
+# Budget changes made while running the app (cleared by reset_demo_data.py)
+data/department_budgets.json

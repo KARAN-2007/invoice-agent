@@ -12,6 +12,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import extract_procurement as doc_reader
 from record_store import (
     RecordStoreError,
     normalize_po_id,
@@ -604,7 +605,219 @@ def render_grn_list(goods_receipts, po_lookup, goods_returns):
 # RECORD GOODS RECEIPT - PREVIEW + SAVE
 # ==================================================
 
-def render_record_grn_preview(purchase_orders, goods_receipts):
+def _audit(step, detail):
+    """Write to the audit log if the database is available."""
+    try:
+        from db_store import save_log
+
+        save_log(step, detail)
+    except Exception:
+        pass
+
+
+def _grn_source_document(po_number):
+    """Link to the uploaded file, if the form was filled from one for this PO."""
+    upload = st.session_state.get("grn_upload_result")
+    if not upload or upload.get("po_number") != po_number:
+        return None
+    return {
+        "file_name": upload.get("file_name"),
+        "sha256": upload.get("sha256"),
+        "read_by_model": upload.get("model"),
+        "grn_number_on_document": (upload.get("extracted") or {}).get("grn_number") or None,
+    }
+
+
+def grn_form_values(po_number, plan):
+    """Form-field values for a document-reading plan, keyed by widget key."""
+    values = {
+        "grn_create_po_select": po_number,
+        f"grn_received_date_{po_number}": plan["received_date"] or date.today(),
+        f"grn_delivery_reference_{po_number}": plan["delivery_reference"],
+        f"grn_notes_{po_number}": plan["notes_text"],
+    }
+    for index, line in enumerate(plan["lines"]):
+        values[f"grn_received_{po_number}_{index}"] = float(line["received"])
+        values[f"grn_accepted_{po_number}_{index}"] = float(line["accepted"])
+        values[f"grn_rejected_{po_number}_{index}"] = float(line["rejected"])
+    return values
+
+
+def _render_grn_upload(eligible_pos, goods_receipts, user=None):
+    """Optional: read a GRN / delivery note with AI and fill the form below."""
+    po_lookup = get_po_lookup(eligible_pos)
+
+    with st.container(border=True):
+        st.markdown("#### Upload a goods receipt instead of typing")
+        st.caption(
+            "Upload the GRN or delivery note as an " + doc_reader.UPLOAD_TYPES_TEXT + " file. "
+            "The AI reads it, finds its purchase order and fills the form below. Check every "
+            "quantity before you continue: nothing is saved until you generate the preview and save it."
+        )
+
+        uploaded = st.file_uploader(
+            "Goods receipt or delivery note",
+            type=doc_reader.UPLOAD_TYPES,
+            key="grn_doc_upload",
+        )
+
+        if uploaded is not None and st.button(
+            "Read document and fill the form",
+            type="primary",
+            key="grn_doc_read",
+        ):
+            file_bytes = uploaded.getvalue()
+            try:
+                with st.spinner("Reading the goods receipt..."):
+                    extracted, model = doc_reader.read_document(
+                        "grn", file_bytes, uploaded.name
+                    )
+            except doc_reader.DocumentReadError as exc:
+                st.error(str(exc))
+                return
+            except Exception as exc:
+                st.error("The document could not be read. Enter the receipt below instead.")
+                st.caption(str(exc)[:200])
+                return
+
+            fingerprint = doc_reader.file_fingerprint(file_bytes)
+            notes = []
+            warnings = []
+
+            if extracted.get("document_type") not in ("goods_receipt", ""):
+                warnings.append(
+                    "This looks like "
+                    + extracted["document_type"].replace("_", " ")
+                    + ", not a goods receipt. Check that you uploaded the right file."
+                )
+
+            # A receipt can only be recorded against an approved goods PO.
+            po_number = doc_reader.match_po_number(
+                extracted.get("po_number"), list(po_lookup)
+            )
+
+            if po_number is None:
+                if extracted.get("po_number"):
+                    warnings.append(
+                        "'" + extracted["po_number"] + "' on the document is not an approved "
+                        "goods purchase order open for receipt. The form was not filled. "
+                        "Select the purchase order yourself."
+                    )
+                else:
+                    warnings.append(
+                        "No PO number could be read from the document. The form was not "
+                        "filled. Select the purchase order yourself."
+                    )
+            else:
+                po = po_lookup[po_number]
+                plan = doc_reader.plan_grn_prefill(
+                    extracted, get_receipt_totals(po, goods_receipts)
+                )
+                notes = ["Purchase order found: " + po_number + "."] + plan["notes"]
+                warnings += plan["warnings"]
+
+                po_vendor = get_po_vendor(po)
+                if extracted.get("vendor_name") and not doc_reader.match_option(
+                    extracted["vendor_name"], [po_vendor]
+                ):
+                    warnings.append(
+                        "The document names '" + extracted["vendor_name"] + "' but "
+                        + po_number + " is with '" + po_vendor + "'. Check the vendor."
+                    )
+
+                if get_grns_for_po(po_number, goods_receipts):
+                    warnings.append(
+                        "A goods receipt is already recorded for " + po_number
+                        + ". A second one cannot be saved for the same PO."
+                    )
+
+                # These widgets are created further down the page, so their
+                # values can still be set for this run.
+                for key, value in grn_form_values(po_number, plan).items():
+                    st.session_state[key] = value
+
+            st.session_state["grn_upload_result"] = {
+                "file_name": uploaded.name,
+                "sha256": fingerprint,
+                "model": model,
+                "extracted": extracted,
+                "po_number": po_number,
+                "notes": notes,
+                "warnings": warnings,
+            }
+            st.session_state.pop("grn_draft_preview", None)
+
+            _audit("tool:read_grn_document", {
+                "user": (user or {}).get("username"),
+                "file": uploaded.name,
+                "format": doc_reader.file_extension(uploaded.name).lstrip("."),
+                "sha256": fingerprint,
+                "model": model,
+                "po_number_on_document": extracted.get("po_number"),
+                "matched_po": po_number,
+                "lines_read": len(extracted.get("items") or []),
+                "warnings": warnings,
+            })
+            st.rerun()
+
+        result = st.session_state.get("grn_upload_result")
+        if not result:
+            return
+
+        extracted = result["extracted"]
+        if result.get("po_number"):
+            st.success(
+                "Form filled from " + str(result["file_name"]) + " for "
+                + str(result["po_number"]) + ". Review it below, then generate the preview."
+            )
+        else:
+            st.error(
+                "The document was read, but the form could not be filled from "
+                + str(result["file_name"]) + "."
+            )
+
+        st.markdown("**What was read from the document**")
+        st.dataframe(
+            [
+                {"Field": "GRN number", "On the document": extracted.get("grn_number") or "-"},
+                {"Field": "PO number", "On the document": extracted.get("po_number") or "-"},
+                {"Field": "Vendor", "On the document": extracted.get("vendor_name") or "-"},
+                {"Field": "Received date", "On the document": extracted.get("received_date") or "-"},
+                {"Field": "Delivery reference", "On the document": extracted.get("delivery_reference") or "-"},
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        item_rows = [
+            {
+                "Description": item.get("description") or "-",
+                "Received": doc_reader.format_number(item.get("quantity_received")) or "-",
+                "Accepted": doc_reader.format_number(item.get("quantity_accepted")) or "-",
+                "Rejected": doc_reader.format_number(item.get("quantity_rejected")) or "-",
+            }
+            for item in extracted.get("items") or []
+        ]
+        if item_rows:
+            st.dataframe(item_rows, use_container_width=True, hide_index=True)
+
+        for note in result["notes"]:
+            st.caption(note)
+        for warning in result["warnings"]:
+            st.warning(warning)
+
+        if st.button("Discard and reset the quantities", key="grn_doc_discard"):
+            filled_po = result.get("po_number")
+            if filled_po in po_lookup:
+                for index, _ in enumerate(get_po_items(po_lookup[filled_po])):
+                    for field in ("received", "accepted", "rejected"):
+                        st.session_state[f"grn_{field}_{filled_po}_{index}"] = 0.0
+            st.session_state.pop("grn_upload_result", None)
+            st.session_state.pop("grn_draft_preview", None)
+            st.rerun()
+
+
+def render_record_grn_preview(purchase_orders, goods_receipts, user=None):
     saved_message = st.session_state.pop("grn_saved_message", None)
     if saved_message:
         st.success(saved_message)
@@ -630,6 +843,10 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
     po_lookup = get_po_lookup(eligible_pos)
     po_numbers = [get_po_number(po) for po in eligible_pos]
 
+    _render_grn_upload(eligible_pos, goods_receipts, user=user)
+
+    st.markdown("#### Goods receipt form")
+
     selected_po_number = st.selectbox(
         "Select purchase order",
         po_numbers,
@@ -651,9 +868,10 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
 
     with st.form(f"create_grn_preview_form_{selected_po_number}"):
         st.markdown("#### Delivery information")
+        # No explicit values on these inputs: the defaults are today's date
+        # and 0, and a document upload can set them through session state.
         received_date = st.date_input(
             "Received date",
-            value=date.today(),
             key=f"grn_received_date_{selected_po_number}",
         )
         delivery_reference = st.text_input(
@@ -687,7 +905,6 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
                     "Received in this delivery",
                     min_value=0.0,
                     max_value=float(remaining),
-                    value=0.0,
                     step=1.0,
                     key=f"grn_received_{selected_po_number}_{index}",
                 )
@@ -696,7 +913,6 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
                     "Accepted",
                     min_value=0.0,
                     max_value=float(remaining),
-                    value=0.0,
                     step=1.0,
                     key=f"grn_accepted_{selected_po_number}_{index}",
                 )
@@ -705,7 +921,6 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
                     "Rejected",
                     min_value=0.0,
                     max_value=float(remaining),
-                    value=0.0,
                     step=1.0,
                     key=f"grn_rejected_{selected_po_number}_{index}",
                 )
@@ -772,6 +987,7 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
                     or selected_po_number
                 ),
                 "po_number": selected_po_number,
+                "source_document": _grn_source_document(selected_po_number),
                 "vendor": vendor_name,
                 "received_date": received_date.isoformat(),
                 "delivery_reference": delivery_reference.strip(),
@@ -877,6 +1093,10 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
                         "total_rejected": draft["total_rejected"],
                         "total_pending_inspection": draft["total_pending_inspection"],
                     }
+                    if draft.get("source_document"):
+                        # Traceability: which uploaded file this GRN came from.
+                        grn_record["source_document"] = draft["source_document"]
+                        grn_record["entry_method"] = "DOCUMENT_UPLOAD_REVIEWED"
 
                     saved_path = save_goods_receipt(po_id, grn_record)
                     relative_path = saved_path.relative_to(BASE_DIR)
@@ -885,6 +1105,22 @@ def render_record_grn_preview(purchase_orders, goods_receipts):
                         "Goods receipt saved successfully: " + str(relative_path)
                     )
                     st.session_state.pop("grn_draft_preview", None)
+                    st.session_state.pop("grn_upload_result", None)
+
+                    # Nothing is outstanding on these lines any more, so
+                    # forget the quantities entered for this receipt.
+                    saved_po = draft["po_number"]
+                    prefixes = tuple(
+                        f"grn_{field}_{saved_po}_"
+                        for field in ("received", "accepted", "rejected")
+                    )
+                    for key in list(st.session_state.keys()):
+                        if str(key).startswith(prefixes):
+                            try:
+                                del st.session_state[key]
+                            except Exception:
+                                pass
+
                     st.rerun()
 
                 except (RecordStoreError, TypeError, ValueError) as exc:
@@ -1058,7 +1294,7 @@ def render_grn_page(user):
         render_grn_list(goods_receipts, po_lookup, goods_returns)
 
     with record_tab:
-        render_record_grn_preview(purchase_orders, goods_receipts)
+        render_record_grn_preview(purchase_orders, goods_receipts, user=user)
 
     with services_tab:
         render_service_confirmations(service_confirmations, po_lookup)

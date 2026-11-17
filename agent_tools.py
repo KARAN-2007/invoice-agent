@@ -1,4 +1,5 @@
 import copy
+import difflib
 import json
 import re
 from datetime import datetime
@@ -12,7 +13,10 @@ from tools import (
     load_saved_goods_receipts,
     load_saved_purchase_orders,
 )
-from rules import evaluate_invoice, load_reference_data
+from rules import evaluate_invoice
+# Reference data with the current department budgets (dataset figures plus
+# any change Finance made), so the budget check uses the live numbers.
+from budget_store import load_live_reference_data as load_reference_data
 
 INVOICE_DIR = Path(__file__).resolve().parent / "invoices"
 LOG_FILE = Path(__file__).resolve().parent / "agent_log.jsonl"
@@ -163,6 +167,7 @@ def start_run(file_name):
 
     _review_reasons.pop(file_name, None)
     _dataset_results.pop(file_name, None)
+    _run_plans.pop(file_name, None)
 
     for key in list(_tool_results):
         if key[0] == file_name:
@@ -987,3 +992,219 @@ def send_to_human_review(
             "Nothing was approved or paid."
         ),
     }
+
+
+# ==================================================
+# AGENT PLANNING AND RECOVERY TOOLS
+# ==================================================
+
+_run_plans = {}
+
+
+def record_plan(file_name: str, plan_steps: list[str], reasoning: str) -> dict:
+    """
+    Record your investigation plan for this invoice before running checks.
+    Call it again with a revised plan whenever a tool result changes what
+    you need to check (for example, the PO was not found).
+
+    Args:
+        file_name: The invoice file name being checked.
+        plan_steps: Ordered list of the checks you intend to run next.
+        reasoning: One or two sentences on why this plan fits this invoice.
+    """
+
+    file_name = str(file_name)
+    steps = [
+        str(step).strip()
+        for step in (plan_steps or [])
+        if str(step).strip()
+    ][:12]
+    reasoning = str(reasoning or "").strip()[:500]
+
+    history = _run_plans.setdefault(file_name, [])
+    revision = len(history) + 1
+    history.append({"steps": steps, "reasoning": reasoning})
+
+    log_step(
+        "agent:plan" if revision == 1 else "agent:plan_revised",
+        {
+            "file": file_name,
+            "revision": revision,
+            "steps": steps,
+            "reasoning": reasoning,
+        },
+    )
+
+    return {
+        "recorded": True,
+        "revision": revision,
+        "note": (
+            "Plan recorded. Execute it. If a result changes what you need "
+            "to check, call record_plan again with the revised plan."
+        ),
+    }
+
+
+def _po_vendor(po):
+    vendor = po.get("vendor_name") or po.get("vendor")
+    if isinstance(vendor, dict):
+        vendor = vendor.get("name") or vendor.get("vendor_name")
+    return str(vendor or "").strip()
+
+
+def _po_total(po):
+    for key in ("total_amount", "grand_total", "total"):
+        value = _to_float(po.get(key))
+        if value is not None:
+            return value
+
+    total = 0.0
+    found = False
+    for item in po.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        qty = _to_float(item.get("quantity_ordered") or item.get("quantity"))
+        price = _to_float(item.get("approved_unit_price") or item.get("unit_price"))
+        if qty is None or price is None:
+            continue
+        tax = _to_float(item.get("tax_percent")) or 0.0
+        total += qty * price * (1 + tax / 100.0)
+        found = True
+
+    return round(total, 2) if found else None
+
+
+def _item_words(items):
+    words = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("description") or item.get("name") or "").lower()
+        words.update(re.findall(r"[a-z0-9]{3,}", text))
+    return words
+
+
+def find_candidate_pos(file_name: str) -> dict:
+    """
+    Use this only when the invoice has no PO number, or lookup_po did not
+    find the PO exactly. Searches purchase orders from the same vendor and
+    ranks them by amount and item similarity. Results are suggestions for a
+    human to confirm: never treat a candidate as the invoice's PO.
+
+    Args:
+        file_name: The invoice file name being checked.
+    """
+
+    file_name = str(file_name)
+    key = _cache_key("find_candidate_pos", file_name)
+    cached = _get_cached(key)
+    if cached is not _CACHE_MISS:
+        return cached
+
+    data = _load_invoice(file_name)
+    if not isinstance(data, dict):
+        result = {
+            "status": "cannot_check",
+            "candidates": [],
+            "note": "The invoice could not be read, so no PO candidates were searched.",
+        }
+        log_step("tool:find_candidate_pos", {"file": file_name, "result": result})
+        return _store_cached(key, result)
+
+    invoice_vendor = str(
+        data.get("vendor") or data.get("vendor_name") or ""
+    ).strip()
+    invoice_vendor_id = str(data.get("vendor_id") or "").strip()
+    invoice_total = _to_float(
+        _first_value(data, "total_amount", "grand_total", "total", "invoice_total")
+    )
+    invoice_words = _item_words(data.get("line_items") or data.get("items"))
+    printed_po = _invoice_po_reference(data)
+
+    # Saved POs take precedence over static reference fixtures.
+    pos = {}
+    try:
+        reference = load_reference_data()
+        for po in reference.get("purchase_orders", []) or []:
+            if isinstance(po, dict) and po.get("po_number"):
+                pos[_normalize_po(po["po_number"])] = po
+    except Exception as exc:
+        log_step("tool:find_candidate_pos:reference_error", {"error": str(exc)[:150]})
+    try:
+        for po in load_saved_purchase_orders():
+            pos[_normalize_po(po["po_number"])] = po
+    except Exception as exc:
+        log_step("tool:find_candidate_pos:saved_error", {"error": str(exc)[:150]})
+
+    candidates = []
+    for po in pos.values():
+        if str(po.get("status") or "").upper() == "CANCELLED":
+            continue
+
+        po_vendor = _po_vendor(po)
+        po_vendor_id = str(po.get("vendor_id") or "").strip()
+        same_vendor = bool(
+            (invoice_vendor_id and po_vendor_id and invoice_vendor_id == po_vendor_id)
+            or (
+                invoice_vendor and po_vendor
+                and difflib.SequenceMatcher(
+                    None, invoice_vendor.lower(), po_vendor.lower()
+                ).ratio() >= 0.85
+            )
+        )
+        if not same_vendor:
+            continue
+
+        po_total = _po_total(po)
+        amount_gap_pct = None
+        amount_score = 0.0
+        if invoice_total and po_total:
+            amount_gap_pct = abs(invoice_total - po_total) / po_total * 100
+            amount_score = max(0.0, 1 - amount_gap_pct / 100)
+
+        po_words = _item_words(po.get("items"))
+        overlap = (
+            len(invoice_words & po_words) / len(invoice_words)
+            if invoice_words else 0.0
+        )
+
+        score = round(50 + 30 * amount_score + 20 * overlap, 1)
+
+        why = ["same vendor"]
+        if amount_gap_pct is not None:
+            why.append(
+                "amount matches" if amount_gap_pct < 0.5
+                else "amount differs by " + str(round(amount_gap_pct, 1)) + "%"
+            )
+        if overlap:
+            why.append("items overlap " + str(round(overlap * 100)) + "%")
+
+        candidates.append({
+            "po_number": po.get("po_number"),
+            "vendor": po_vendor,
+            "po_status": po.get("status"),
+            "po_total": po_total,
+            "match_score": score,
+            "why": ", ".join(why),
+        })
+
+    candidates.sort(key=lambda c: (-c["match_score"], str(c["po_number"])))
+    candidates = candidates[:3]
+
+    result = {
+        "status": "candidates_found" if candidates else "no_candidates",
+        "printed_po": printed_po,
+        "invoice_vendor": invoice_vendor,
+        "invoice_total": invoice_total,
+        "candidates": candidates,
+        "note": (
+            "Suggestions only. A human must confirm the correct PO with the "
+            "vendor or procurement; the invoice stays in human review."
+            if candidates else
+            "No purchase orders from this vendor were found. Procurement "
+            "should confirm whether a PO exists."
+        ),
+    }
+
+    log_step("tool:find_candidate_pos", {"file": file_name, "result": result})
+    return _store_cached(key, result)

@@ -808,6 +808,173 @@ def mark_payment_paid(payment_id, paid_by, batch_id=None, *, actor_role=None):
     return invoice_number
 
 
+GATEWAY_PAYER_ROLES = {"finance_officer", "admin", "final_approver", "approver"}
+
+
+def get_payment_schedule(payment_id=None, *, approval_request_id=None):
+    """Return one payment schedule row as a dict, or None."""
+    if payment_id is None and approval_request_id is None:
+        raise ValueError("A payment ID or approval request ID is required.")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT " + ", ".join(PAYMENT_COLUMNS) + " FROM payment_schedules WHERE "
+            if payment_id is not None:
+                cur.execute(sql + "id = %s;", (payment_id,))
+            else:
+                cur.execute(sql + "approval_request_id = %s;", (approval_request_id,))
+            row = cur.fetchone()
+        return dict(zip(PAYMENT_COLUMNS, row)) if row else None
+    finally:
+        conn.close()
+
+
+def _final_approver_of(cur, approval_request_id):
+    """Username who gave the final approval for a request, if recorded."""
+    cur.execute("SELECT to_regclass('approval_workflow_stages');")
+    if cur.fetchone()[0] is not None:
+        cur.execute(
+            """
+            SELECT decided_by FROM approval_workflow_stages
+            WHERE request_id = %s AND stage_key = 'FINAL_APPROVER' AND status = 'APPROVED';
+            """,
+            (approval_request_id,),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            return str(row[0])
+    cur.execute(
+        "SELECT decided_by FROM approval_requests WHERE id = %s AND status = 'APPROVED';",
+        (approval_request_id,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def can_pay_through_gateway(payment, username, actor_role):
+    """UI helper: may this user open the payment window for this schedule?"""
+    role = str(actor_role or "").strip().lower()
+    if role not in GATEWAY_PAYER_ROLES or not payment:
+        return False
+    if role in {"finance_officer", "admin"}:
+        return True
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            return _final_approver_of(cur, payment["approval_request_id"]) == str(username)
+    finally:
+        conn.close()
+
+
+def record_gateway_payment(payment_id, gateway_result, paid_by, *, actor_role=None):
+    """Record a successful sandbox gateway charge against a scheduled payment.
+
+    Finance Officers and Admins may pay any scheduled entry. A Final Approver
+    may pay only an invoice whose final approval they personally gave.
+    Returns the invoice number, or None if the entry was already processed.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    role = str(actor_role or "").strip().lower()
+    if role not in GATEWAY_PAYER_ROLES:
+        raise PermissionError("Only Final Approvers, Finance Officers or Admins can pay invoices.")
+
+    result = gateway_result or {}
+    if str(result.get("status") or "").upper() != "SUCCESS":
+        raise ValueError("Only a successful gateway result can be recorded as paid.")
+    transaction_id = str(result.get("transaction_id") or "").strip()
+    if not transaction_id or len(transaction_id) > 50:
+        raise ValueError("The gateway did not return a valid transaction ID.")
+    if str(result.get("payment_id")) != str(payment_id):
+        raise ValueError("The gateway result does not belong to this payment.")
+    try:
+        charged = Decimal(str(result.get("amount")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("The gateway result has no valid amount.")
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT approval_request_id, invoice_amount
+                FROM payment_schedules WHERE id = %s FOR UPDATE;
+                """,
+                (payment_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("Payment schedule was not found.")
+            approval_request_id, amount = row
+
+            if role in {"final_approver", "approver"}:
+                if _final_approver_of(cur, approval_request_id) != str(paid_by):
+                    raise PermissionError(
+                        "Only the Final Approver who approved this invoice can pay it."
+                    )
+
+            if charged != Decimal(str(amount)):
+                raise ValueError("The charged amount does not match the scheduled amount.")
+
+            cur.execute(
+                """
+                UPDATE payment_schedules
+                SET payment_status = 'PAID', paid_at = CURRENT_TIMESTAMP,
+                    paid_by = %s, payment_batch_id = %s
+                WHERE id = %s AND payment_status = 'SCHEDULED'
+                RETURNING invoice_number;
+                """,
+                (paid_by, transaction_id, payment_id),
+            )
+            updated = cur.fetchone()
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    if updated is None:
+        return None
+    save_log(
+        "human:payment_gateway_paid",
+        {
+            "payment_id": payment_id,
+            "invoice": updated[0],
+            "approval_request_id": approval_request_id,
+            "by": paid_by,
+            "role": role,
+            "transaction_id": transaction_id,
+            "order_id": result.get("order_id"),
+            "method": result.get("method_display"),
+            "amount": result.get("amount"),
+            "gateway": result.get("gateway"),
+            "sandbox": bool(result.get("sandbox")),
+        },
+    )
+    return updated[0]
+
+
+def log_gateway_failure(payment_id, gateway_result, attempted_by):
+    """Audit a declined gateway attempt. The schedule stays SCHEDULED."""
+    result = gateway_result or {}
+    return save_log(
+        "human:payment_gateway_failed",
+        {
+            "payment_id": payment_id,
+            "by": attempted_by,
+            "order_id": result.get("order_id"),
+            "method": result.get("method_display"),
+            "amount": result.get("amount"),
+            "reason": result.get("failure_reason"),
+            "sandbox": bool(result.get("sandbox")),
+        },
+    )
+
+
 def cancel_payment(payment_id, cancelled_by, *, actor_role=None):
     """Cancel a scheduled payment that has not yet been processed."""
     _require_payment_operator(actor_role)

@@ -29,9 +29,9 @@ REASONS = {
     ),
 
     "CUMULATIVE_PO_OVERBILL": (
-        "PO over-billed",
+        "Billed more than PO quantity",
         "high",
-        "Earlier invoices plus this one add up to more than the purchase order allows.",
+        "This invoice, together with any earlier invoices on the same PO, bills more units than the purchase order allows.",
     ),
 
     "PO_UNIT_PRICE_MISMATCH": (
@@ -114,6 +114,72 @@ REASONS = {
 }
 
 
+# The standalone three-way matcher reports its own finding types. Map them to
+# the rules-engine vocabulary so approvers see one consistent set of labels.
+MATCHER_TYPE_TO_REASON = {
+    "UNIT_PRICE_EXCEEDED": "PO_UNIT_PRICE_MISMATCH",
+    "INVOICE_EXCEEDS_ACCEPTED_GRN_QUANTITY": "GRN_QUANTITY_SHORTAGE",
+    "INVOICE_EXCEEDS_PO_QUANTITY": "CUMULATIVE_PO_OVERBILL",
+    "MISSING_GRN": "MISSING_GOODS_RECEIPT",
+    "MISSING_PO": "PO_REFERENCE_UNMAPPED",
+    "PO_CANCELLED": "CANCELLED_PO",
+    "VENDOR_ID_MISMATCH": "VENDOR_PO_MISMATCH",
+    "VENDOR_NAME_MISMATCH": "VENDOR_PO_MISMATCH",
+    "VENDOR_MISMATCH": "VENDOR_PO_MISMATCH",
+    "DUPLICATE_INVOICE": "DUPLICATE_INVOICE",
+}
+
+# Matcher findings with no rules-engine equivalent.
+MATCHER_ONLY_LABELS = {
+    "INVOICE_TOTAL_EXCEEDS_PO": "Total exceeds PO value",
+    "GRN_HAS_REJECTED_QUANTITY": "Some delivered units were rejected",
+    "GRN_PENDING_INSPECTION": "Goods pending inspection",
+    "GRN_CANCELLED": "Goods receipt cancelled",
+    "GRN_ACCEPTED_QUANTITY_MISSING": "Accepted quantity not recorded",
+    "GRN_ITEMS_MISSING": "Goods receipt has no items",
+    "UNIT_PRICE_NOT_VERIFIABLE": "Price could not be verified",
+    "UNKNOWN_OR_AMBIGUOUS_ITEM": "Item not found on PO",
+    "INVOICE_ITEMS_MISSING": "Invoice has no line items",
+    "INVOICE_QUANTITY_MISSING": "Invoice quantity missing",
+    "INVOICE_VENDOR_MISSING": "Invoice vendor missing",
+    "MISSING_INVOICE_NUMBER": "Invoice number missing",
+    "PO_ITEMS_MISSING": "PO has no items",
+    "PO_QUANTITY_MISSING": "PO quantity missing",
+    "PO_VENDOR_MISSING": "PO vendor missing",
+}
+
+
+def matcher_finding_label(finding_type):
+    """Plain-English label for a matcher finding, aligned with rule codes."""
+
+    finding_type = str(finding_type or "").strip().upper()
+    if finding_type in MATCHER_TYPE_TO_REASON:
+        return reason_label(MATCHER_TYPE_TO_REASON[finding_type])
+    if finding_type in MATCHER_ONLY_LABELS:
+        return MATCHER_ONLY_LABELS[finding_type]
+    if not finding_type:
+        return "Issue"
+    return finding_type.replace("_", " ").capitalize()
+
+
+def describe_matcher_findings(findings, limit=5):
+    """Return 'Label: details' lines for matcher findings, without repeats."""
+
+    lines = []
+    for item in findings or []:
+        if not isinstance(item, dict):
+            continue
+        line = matcher_finding_label(item.get("type"))
+        details = str(item.get("details") or "").strip()
+        if details:
+            line += ": " + details
+        if line not in lines:
+            lines.append(line)
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 NOT_REASONS = {
     "READY_FOR_APPROVAL",
     "NEEDS_HUMAN_REVIEW",
@@ -123,7 +189,7 @@ NOT_REASONS = {
 COLORS = {
     "high": ("#FDECEF", "#B8283F"),
     "medium": ("#FFF4DC", "#9A6200"),
-    "info": ("#E8ECFE", "#3340F2"),
+    "info": ("#E3F1EE", "#0F6F62"),
 }
 
 

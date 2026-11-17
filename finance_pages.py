@@ -1,9 +1,12 @@
-"""Preview-only finance workspace for the invoice-agent demo.
+"""Finance workspace for the invoice-agent demo.
+
+Department budgets are live: they come from the reference dataset plus any
+change a Finance Officer or Admin makes here (see budget_store.py), and the
+agent's invoice budget check uses the same figures.
 
 Department attribution is intentionally read from the purchase-order / requisition
-record, never guessed from the vendor invoice. The data in this module is fictional
-UI preview data only. Replace the preview collections with backend service calls
-when the PostgreSQL budget and payment APIs are available.
+record, never guessed from the vendor invoice. The payment schedule and the
+unmapped-record examples below are still fictional preview data.
 """
 
 from __future__ import annotations
@@ -12,35 +15,21 @@ from typing import Any
 
 import streamlit as st
 
+from budget_store import (
+    EDIT_ROLES,
+    BudgetError,
+    budget_change_history,
+    budget_status,
+    department_budget_rows,
+    set_department_budget,
+)
+from theme import amount_tile_html
+
 
 # ---------------------------------------------------------------------------
 # FICTIONAL PREVIEW DATA ONLY.
 # No values below represent actual university budgets or payment obligations.
 # ---------------------------------------------------------------------------
-
-DEMO_BUDGETS: list[dict[str, Any]] = [
-    {
-        "department": "Academic Laboratories",
-        "cost_center": "ACAD-LAB",
-        "allocated": 500_000.00,
-        "spent": 180_000.00,
-        "committed": 120_000.00,
-    },
-    {
-        "department": "Computer Science",
-        "cost_center": "CSE-OPS",
-        "allocated": 350_000.00,
-        "spent": 205_000.00,
-        "committed": 70_000.00,
-    },
-    {
-        "department": "Campus Administration",
-        "cost_center": "ADMIN-GEN",
-        "allocated": 250_000.00,
-        "spent": 90_000.00,
-        "committed": 55_000.00,
-    },
-]
 
 # This is an intentionally unmapped example to show the exception workflow.
 # It is not a real invoice or PO and is excluded from all department totals.
@@ -129,24 +118,26 @@ def _money(value: Any) -> str:
         return "—"
 
 
-def _budget_rows() -> list[dict[str, Any]]:
-    """Calculate display-only totals for the fictional preview budgets."""
-    rows: list[dict[str, Any]] = []
-    for record in DEMO_BUDGETS:
-        allocated = float(record["allocated"])
-        spent = float(record["spent"])
-        committed = float(record["committed"])
-        available = allocated - spent - committed
-        utilization = ((spent + committed) / allocated * 100) if allocated > 0 else 0.0
-        rows.append(
-            {
-                **record,
-                "available": available,
-                "utilization": utilization,
-                "mapping_status": "MAPPED",
-            }
-        )
-    return rows
+def _tile(column: Any, label: str, value: Any) -> None:
+    """Metric tile that never hides the amount: hover shows the full value."""
+    column.markdown(amount_tile_html(label, value), unsafe_allow_html=True)
+
+
+STATUS_LABELS = {
+    "OK": "Within budget",
+    "LOW": "Low (10% or less left)",
+    "EXCEEDED": "Over budget",
+    "UNKNOWN": "No budget figures",
+}
+
+
+def _audit(step: str, detail: dict[str, Any]) -> None:
+    try:
+        from db_store import save_log
+
+        save_log(step, detail)
+    except Exception:
+        pass
 
 
 def _status_text(status: str) -> str:
@@ -197,11 +188,105 @@ def _render_department_mapping_exceptions() -> None:
         )
 
 
-def render_budget_overview() -> None:
+def _last_change_text(row: dict[str, Any]) -> str:
+    if row.get("source") == "FINANCE_UPDATE":
+        return f"{row.get('updated_by') or 'Finance'}, {str(row.get('updated_at') or '')[:10]}"
+    return "Reference dataset"
+
+
+def _render_budget_editor(user: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    st.markdown("### Change a department budget")
+    role = str(user.get("role") or "").strip().lower()
+    if role not in EDIT_ROLES:
+        st.caption("Only a Finance Officer or Admin can change a department budget.")
+        return
+
+    st.caption(
+        "Set a department's new allocated budget. A reason is required, and the "
+        "budget cannot go below what the department has already used. The change "
+        "applies straight away to new purchase orders and to the agent's invoice "
+        "budget check, and it is written to the audit log."
+    )
+    if not rows:
+        st.info("No departments with IDs were found in the reference data.")
+        return
+
+    labels = {f"{row['name']} ({row['department_id']})": row for row in rows}
+    label = st.selectbox(
+        "Department to change", list(labels), key="finance_budget_edit_department"
+    )
+    row = labels[label]
+    current = row.get("allocated")
+    st.caption(
+        f"Allocated now: {_money(current)} · Already used: {_money(row.get('consumed'))}"
+    )
+
+    with st.form(f"finance_budget_edit_form_{row['department_id']}", clear_on_submit=False):
+        new_amount = st.text_input(
+            "New allocated budget (INR)",
+            value="" if current is None else f"{current:.2f}",
+            help="Commas are fine, for example 2,50,000.",
+        )
+        reason = st.text_area(
+            "Reason for the change",
+            placeholder="For example: mid-year top-up approved by the finance committee",
+            max_chars=300,
+        )
+        submitted = st.form_submit_button("Save new budget", type="primary")
+
+    if submitted:
+        try:
+            entry = set_department_budget(
+                row["department_id"], new_amount, user, reason
+            )
+        except BudgetError as exc:
+            st.error(str(exc))
+        except OSError:
+            st.error("The budget could not be saved. Check that the data folder is writable.")
+        else:
+            _audit("finance:budget_change", entry)
+            st.session_state["finance_budget_notice"] = (
+                f"{entry['department']}: allocated budget changed from "
+                f"{_money(entry['previous_allocated'])} to {_money(entry['budget_allocated'])}."
+            )
+            st.rerun()
+
+
+def _render_budget_history() -> None:
+    history = budget_change_history()
+    st.markdown("### Budget change history")
+    if not history:
+        st.caption("No budget changes yet. All budgets are the reference dataset figures.")
+        return
+    st.dataframe(
+        [
+            {
+                "When (UTC)": str(row.get("updated_at") or "").replace("T", " ")[:16],
+                "Department": row.get("department"),
+                "From": _money(row.get("previous_allocated")),
+                "To": _money(row.get("budget_allocated")),
+                "Changed by": row.get("updated_by"),
+                "Reason": row.get("reason"),
+            }
+            for row in history
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_budget_overview(user: dict[str, Any] | None = None) -> None:
+    user = user or {}
     st.markdown("### Department budget overview")
+
+    notice = st.session_state.pop("finance_budget_notice", None)
+    if notice:
+        st.success(notice)
+
     st.info(
-        "Preview mode — all amounts and department names below are fictional examples. "
-        "They are not live university balances and cannot authorize spending."
+        "Budgets come from the reference dataset (synthetic demo figures, not real "
+        "university balances) plus any change saved here. New purchase orders and "
+        "the agent's invoice budget check use these same figures."
     )
     st.markdown(
         "**Where does the department come from?** The vendor invoice does not need to "
@@ -209,49 +294,51 @@ def render_budget_overview() -> None:
         "matched PO or linked purchase requisition."
     )
 
-    rows = _budget_rows()
-    total_allocated = sum(row["allocated"] for row in rows)
-    total_spent = sum(row["spent"] for row in rows)
-    total_committed = sum(row["committed"] for row in rows)
-    total_available = sum(row["available"] for row in rows)
+    rows = department_budget_rows()
+    known = [row for row in rows if row.get("available") is not None]
+    total_allocated = sum(row["allocated"] for row in known)
+    total_used = sum(row["consumed"] for row in known)
+    total_available = sum(row["available"] for row in known)
+    needs_attention = sum(1 for row in rows if budget_status(row) in {"LOW", "EXCEEDED"})
     unassigned_count = len(DEMO_UNMAPPED_COMMITMENTS)
-    unassigned_amount = sum(float(row["amount"]) for row in DEMO_UNMAPPED_COMMITMENTS)
 
     metric_cols = st.columns(5)
-    metric_cols[0].metric("Total allocated", _money(total_allocated))
-    metric_cols[1].metric("Spent", _money(total_spent))
-    metric_cols[2].metric("Committed", _money(total_committed))
-    metric_cols[3].metric("Available", _money(total_available))
-    metric_cols[4].metric("Unassigned records", unassigned_count)
+    _tile(metric_cols[0], "Total allocated", _money(total_allocated))
+    _tile(metric_cols[1], "Already used", _money(total_used))
+    _tile(metric_cols[2], "Available", _money(total_available))
+    _tile(metric_cols[3], "Low or over budget", needs_attention)
+    _tile(metric_cols[4], "Unassigned records", unassigned_count)
 
     st.caption(
-        "Available = allocated − spent − committed. Unassigned records are excluded "
-        "from these department totals until their PO / requisition mapping is resolved. "
-        f"Illustrative unassigned amount: {_money(unassigned_amount)}."
+        "Available = allocated − already used, the same rule the invoice budget check "
+        "uses. Unassigned records are excluded from these totals until their PO / "
+        "requisition mapping is resolved."
     )
     st.divider()
 
-    departments = ["All departments"] + [row["department"] for row in rows]
+    departments = ["All departments"] + [row["name"] for row in rows]
     selected = st.selectbox(
         "Filter by department",
         departments,
         key="finance_budget_department_filter",
     )
     visible = rows if selected == "All departments" else [
-        row for row in rows if row["department"] == selected
+        row for row in rows if row["name"] == selected
     ]
 
     st.dataframe(
         [
             {
-                "Department": row["department"],
-                "Cost centre": row["cost_center"],
-                "Mapping": row["mapping_status"],
+                "Department": row["name"],
+                "Department ID": row["department_id"],
                 "Allocated": _money(row["allocated"]),
-                "Spent": _money(row["spent"]),
-                "Committed": _money(row["committed"]),
+                "Already used": _money(row["consumed"]),
                 "Available": _money(row["available"]),
-                "Utilization": f"{row['utilization']:.1f}%",
+                "Used": (
+                    f"{row['utilisation']:.1f}%" if row.get("utilisation") is not None else "—"
+                ),
+                "Status": STATUS_LABELS[budget_status(row)],
+                "Allocated budget set by": _last_change_text(row),
             }
             for row in visible
         ],
@@ -261,21 +348,23 @@ def render_budget_overview() -> None:
 
     st.markdown("### Budget utilization")
     for row in visible:
-        st.markdown(
-            f"**{row['department']}** · {row['utilization']:.1f}% used or committed"
-        )
-        st.progress(min(max(row["utilization"] / 100.0, 0.0), 1.0))
-        if row["available"] < 0:
-            st.error("Illustrative budget exceeded")
-        elif row["available"] <= row["allocated"] * 0.1:
-            st.warning("Illustrative remaining balance is low")
+        if row.get("utilisation") is None:
+            st.markdown(f"**{row['name']}** · no budget figures")
+            continue
+        st.markdown(f"**{row['name']}** · {row['utilisation']:.1f}% used")
+        st.progress(min(max(row["utilisation"] / 100.0, 0.0), 1.0))
+        status = budget_status(row)
+        if status == "EXCEEDED":
+            st.error("Budget exceeded")
+        elif status == "LOW":
+            st.warning("Remaining balance is low")
 
     st.divider()
+    _render_budget_editor(user, rows)
+    st.divider()
+    _render_budget_history()
+    st.divider()
     _render_department_mapping_exceptions()
-    st.caption(
-        "Backend connection pending: live PO-to-department mapping, budget reservations, "
-        "actual expenditure, and balance updates will come from the PostgreSQL backend."
-    )
 
 
 def _render_blocked_scheduling_examples() -> None:
@@ -327,11 +416,11 @@ def render_payment_schedule() -> None:
     unpaid_total = sum(float(row["amount"]) for row in rows if row["status"] != "PAID")
 
     metrics = st.columns(5)
-    metrics[0].metric("Scheduled", status_counts["SCHEDULED"])
-    metrics[1].metric("Due soon", status_counts["DUE SOON"])
-    metrics[2].metric("Overdue", status_counts["OVERDUE"])
-    metrics[3].metric("Paid", status_counts["PAID"])
-    metrics[4].metric("Unpaid total", _money(unpaid_total))
+    _tile(metrics[0], "Scheduled", status_counts["SCHEDULED"])
+    _tile(metrics[1], "Due soon", status_counts["DUE SOON"])
+    _tile(metrics[2], "Overdue", status_counts["OVERDUE"])
+    _tile(metrics[3], "Paid", status_counts["PAID"])
+    _tile(metrics[4], "Unpaid total", _money(unpaid_total))
 
     st.divider()
     selected_status = st.selectbox(
@@ -397,9 +486,9 @@ def render_payment_schedule() -> None:
 
 
 def render_finance_page(user: dict[str, Any]) -> None:
-    """Render the preview-only finance workspace for administrators."""
+    """Render the finance workspace for Finance Officers and Admins."""
     role = str(user.get("role") or "").strip().lower()
-    if role != "admin":
+    if role not in {"admin", "finance_officer"}:
         st.error("You do not have permission to open the finance workspace.")
         return
 
@@ -415,6 +504,6 @@ def render_finance_page(user: dict[str, Any]) -> None:
 
     budget_tab, payment_tab = st.tabs(["Budget overview", "Payment schedule"])
     with budget_tab:
-        render_budget_overview()
+        render_budget_overview(user)
     with payment_tab:
         render_payment_schedule()

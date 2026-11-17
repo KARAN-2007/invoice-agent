@@ -15,6 +15,14 @@ from pathlib import Path
 
 import streamlit as st
 
+import extract_procurement as doc_reader
+from budget_store import (
+    apply_budget_changes,
+    budget_status,
+    find_department_budget,
+    po_budget_check,
+)
+from theme import amount_tile_html
 from record_store import (
     RecordStoreError,
     normalize_po_id,
@@ -89,13 +97,8 @@ def merge_saved_purchase_orders(reference, base_dir=None):
     return data
 
 
-def get_next_po_id(purchase_orders, base_dir=None):
-    """Choose the next numeric PO ID, including fixture and saved PO records.
-
-    The current reference dataset uses PO-101 through PO-118 and has no
-    separate po_id field. Therefore the numeric PO-number suffix is used as
-    the fallback PO ID until the database backend supplies its own ID.
-    """
+def get_used_po_ids(purchase_orders, base_dir=None):
+    """Every numeric PO ID already taken by a fixture or a saved record."""
     candidates = []
 
     for po in purchase_orders if isinstance(purchase_orders, list) else []:
@@ -119,6 +122,18 @@ def get_next_po_id(purchase_orders, base_dir=None):
             except (TypeError, ValueError):
                 continue
 
+    return candidates
+
+
+def get_next_po_id(purchase_orders, base_dir=None):
+    """Choose the next numeric PO ID, including fixture and saved PO records.
+
+    The current reference dataset uses PO-101 through PO-118 and has no
+    separate po_id field. Therefore the numeric PO-number suffix is used as
+    the fallback PO ID until the database backend supplies its own ID.
+    """
+    candidates = get_used_po_ids(purchase_orders, base_dir=base_dir)
+
     # The supplied demonstration dataset starts at PO-101. In a blank local
     # folder, continue that convention rather than creating PO-1 unexpectedly.
     return max(candidates, default=100) + 1
@@ -133,7 +148,8 @@ def load_procurement_data():
         if not isinstance(data, dict):
             raise ValueError("Invalid procurement reference data.")
 
-        return merge_saved_purchase_orders(data)
+        # Department budgets include any change Finance has made.
+        return apply_budget_changes(merge_saved_purchase_orders(data))
 
     except FileNotFoundError:
         st.error("dataset/reference_data.json was not found.")
@@ -295,7 +311,7 @@ def get_dataframe_height(row_count, max_height=900):
 # ==================================================
 
 
-def render_po_details(po):
+def render_po_details(po, live_reference=None):
     st.markdown("### Purchase order details")
 
     col1, col2, col3 = st.columns(3)
@@ -334,6 +350,29 @@ def render_po_details(po):
         st.write(get_po_cost_center(po))
     if get_po_department(po) == "UNASSIGNED":
         st.caption("Budget validation cannot be completed until this PO is mapped.")
+    else:
+        budget = find_department_budget(get_po_department_id(po), live_reference)
+        if budget and budget.get("available") is not None:
+            st.caption(
+                f"Department budget now: {_money_inr(budget['available'])} available "
+                f"of {_money_inr(budget['allocated'])} allocated."
+            )
+        else:
+            st.caption("This department has no budget figures, so the budget cannot be checked.")
+
+    saved_check = po.get("budget_check_at_creation")
+    if isinstance(saved_check, dict) and saved_check.get("checked"):
+        if saved_check.get("exceeds_available_budget"):
+            st.warning(
+                "When this PO was created it was over the department's available "
+                f"budget ({_money_inr(saved_check.get('po_amount_inr'))} against "
+                f"{_money_inr(saved_check.get('available_before_inr'))} available)."
+            )
+        else:
+            st.caption(
+                "When this PO was created it fitted the budget: "
+                f"{_money_inr(saved_check.get('available_after_inr'))} was left afterwards."
+            )
 
     st.markdown("**Order status**")
     render_status(get_status(po))
@@ -499,6 +538,303 @@ def render_po_list(purchase_orders):
 # ==================================================
 
 
+MAX_PO_ITEMS = 8
+
+
+def _audit(step, detail):
+    """Write to the audit log if the database is available."""
+    try:
+        from db_store import save_log
+
+        save_log(step, detail)
+    except Exception:
+        pass
+
+
+def _department_label(option):
+    return f"{option['name']} ({option['department_id']})"
+
+
+def get_currency_options(reference):
+    currencies = sorted({
+        str(po.get("currency") or "INR")
+        for po in reference.get("purchase_orders", [])
+        if isinstance(po, dict)
+    })
+    if not currencies:
+        currencies = ["INR"]
+    if "INR" not in currencies:
+        currencies.insert(0, "INR")
+    return currencies
+
+
+def po_form_values(plan, extracted, has_vendor_list):
+    """Form-field values for a document-reading plan, keyed by widget key.
+
+    Only values that the form can accept are returned: a vendor, department
+    or currency appears here only if it matched the reference lists.
+    """
+    items = plan["items"][:MAX_PO_ITEMS]
+    values = {"po_item_count": max(1, len(items))}
+
+    for index in range(MAX_PO_ITEMS):
+        item = items[index] if index < len(items) else {}
+        values[f"po_item_description_{index}"] = item.get("description", "")
+        values[f"po_item_quantity_text_{index}"] = item.get("quantity", "")
+        values[f"po_item_price_text_{index}"] = item.get("unit_price", "")
+
+    if has_vendor_list:
+        if plan["vendor"]:
+            values["po_vendor_select"] = plan["vendor"]
+    else:
+        values["po_vendor_text"] = extracted.get("vendor_name") or ""
+
+    if plan["department"]:
+        values["po_department"] = _department_label(plan["department"])
+    if plan["currency"]:
+        values["po_currency_select"] = plan["currency"]
+
+    return values
+
+
+def _render_po_upload(reference, vendor_options, department_options, currencies, user):
+    """Optional: read a PO image or PDF with AI and fill the form below."""
+    with st.container(border=True):
+        st.markdown("#### Upload a purchase order instead of typing")
+        st.caption(
+            "Upload the purchase order as an " + doc_reader.UPLOAD_TYPES_TEXT + " file. "
+            "The AI reads it and fills the form below. Check every field before you "
+            "continue: nothing is saved until you generate the preview and save it."
+        )
+
+        uploaded = st.file_uploader(
+            "Purchase order document",
+            type=doc_reader.UPLOAD_TYPES,
+            key="po_doc_upload",
+        )
+
+        if uploaded is not None and st.button(
+            "Read document and fill the form",
+            type="primary",
+            key="po_doc_read",
+        ):
+            file_bytes = uploaded.getvalue()
+            try:
+                with st.spinner("Reading the purchase order..."):
+                    extracted, model = doc_reader.read_document(
+                        "po", file_bytes, uploaded.name
+                    )
+            except doc_reader.DocumentReadError as exc:
+                st.error(str(exc))
+                return
+            except Exception as exc:
+                st.error("The document could not be read. Type the details below instead.")
+                st.caption(str(exc)[:200])
+                return
+
+            plan = doc_reader.plan_po_prefill(
+                extracted,
+                vendor_options,
+                department_options,
+                currencies,
+                get_used_po_ids(reference.get("purchase_orders", [])),
+                max_items=MAX_PO_ITEMS,
+            )
+
+            # These widgets are created further down the page, so their
+            # values can still be set for this run.
+            for key, value in po_form_values(
+                plan, extracted, bool(vendor_options)
+            ).items():
+                st.session_state[key] = value
+
+            fingerprint = doc_reader.file_fingerprint(file_bytes)
+            st.session_state["po_upload_result"] = {
+                "file_name": uploaded.name,
+                "sha256": fingerprint,
+                "model": model,
+                "extracted": extracted,
+                "printed_po_id": plan["printed_po_id"],
+                "notes": plan["notes"],
+                "warnings": plan["warnings"],
+            }
+            st.session_state["po_use_printed_number"] = plan["printed_po_id"] is not None
+            st.session_state.pop("po_draft_preview", None)
+
+            _audit("tool:read_po_document", {
+                "user": (user or {}).get("username"),
+                "file": uploaded.name,
+                "format": doc_reader.file_extension(uploaded.name).lstrip("."),
+                "sha256": fingerprint,
+                "model": model,
+                "po_number_on_document": extracted.get("po_number"),
+                "vendor_on_document": extracted.get("vendor_name"),
+                "lines_read": len(extracted.get("items") or []),
+                "warnings": plan["warnings"],
+            })
+            st.rerun()
+
+        result = st.session_state.get("po_upload_result")
+        if not result:
+            return
+
+        extracted = result["extracted"]
+        st.success(
+            "Form filled from " + str(result["file_name"])
+            + ". Review it below, then generate the preview."
+        )
+
+        st.markdown("**What was read from the document**")
+        st.dataframe(
+            [
+                {"Field": "PO number", "On the document": extracted.get("po_number") or "-"},
+                {"Field": "PO date", "On the document": extracted.get("po_date") or "-"},
+                {"Field": "Vendor", "On the document": extracted.get("vendor_name") or "-"},
+                {"Field": "Vendor GSTIN", "On the document": extracted.get("vendor_gstin") or "-"},
+                {"Field": "Department", "On the document": extracted.get("department") or "-"},
+                {"Field": "Currency", "On the document": extracted.get("currency") or "-"},
+                {"Field": "Subtotal", "On the document": doc_reader.format_number(extracted.get("subtotal")) or "-"},
+                {"Field": "Tax", "On the document": doc_reader.format_number(extracted.get("tax_amount")) or "-"},
+                {"Field": "Total", "On the document": doc_reader.format_number(extracted.get("total")) or "-"},
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        item_rows = [
+            {
+                "Description": item.get("description") or "-",
+                "Quantity": doc_reader.format_number(item.get("quantity")) or "-",
+                "Unit": item.get("unit") or "-",
+                "Unit price": doc_reader.format_number(item.get("unit_price")) or "-",
+                "Tax %": doc_reader.format_number(item.get("tax_percent")) or "-",
+                "Line total": doc_reader.format_number(item.get("line_total")) or "-",
+            }
+            for item in extracted.get("items") or []
+        ]
+        if item_rows:
+            st.dataframe(item_rows, use_container_width=True, hide_index=True)
+
+        for note in result["notes"]:
+            st.caption(note)
+        for warning in result["warnings"]:
+            st.warning(warning)
+
+        if result.get("printed_po_id") is not None:
+            st.checkbox(
+                "Keep the PO number printed on the document (PO-"
+                + str(result["printed_po_id"])
+                + "), so invoices quoting it are matched to this order",
+                key="po_use_printed_number",
+            )
+
+        if st.button("Discard and clear the line items", key="po_doc_discard"):
+            empty_plan = {"items": [], "vendor": None, "department": None, "currency": None}
+            for key, value in po_form_values(empty_plan, {}, True).items():
+                st.session_state[key] = value
+            st.session_state.pop("po_upload_result", None)
+            st.session_state.pop("po_draft_preview", None)
+            st.rerun()
+
+
+def _money_inr(value):
+    try:
+        return f"₹{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "Not available"
+
+
+def _budget_source_text(row):
+    if row.get("source") == "FINANCE_UPDATE":
+        when = str(row.get("updated_at") or "")[:10]
+        who = row.get("updated_by") or "Finance"
+        return f"Allocated budget last changed by {who}" + (f" on {when}." if when else ".")
+    return "Allocated budget from the reference dataset."
+
+
+def _render_department_budget(reference, department_id):
+    """Show the selected department's allocated, used and available budget."""
+    st.markdown("**Department budget**")
+    if not department_id:
+        st.caption("Select a department to see its budget.")
+        return None
+
+    row = find_department_budget(department_id, reference)
+    if row is None or row.get("available") is None:
+        st.warning(
+            "This department has no budget figures in the reference data, so the "
+            "budget cannot be checked. Invoices against this PO will need a human "
+            "to confirm the budget."
+        )
+        return row
+
+    columns = st.columns(3)
+    columns[0].markdown(
+        amount_tile_html("Allocated", _money_inr(row["allocated"])),
+        unsafe_allow_html=True,
+    )
+    columns[1].markdown(
+        amount_tile_html("Already used", _money_inr(row["consumed"])),
+        unsafe_allow_html=True,
+    )
+    columns[2].markdown(
+        amount_tile_html("Available", _money_inr(row["available"])),
+        unsafe_allow_html=True,
+    )
+
+    status = budget_status(row)
+    used_share = row.get("utilisation")
+    if status == "EXCEEDED":
+        st.error("This department has already spent more than its allocated budget.")
+    elif status == "LOW":
+        st.warning(
+            f"Budget is running low: {used_share:.1f}% used, "
+            f"{_money_inr(row['available'])} left."
+        )
+    elif used_share is not None:
+        st.progress(min(max(used_share / 100.0, 0.0), 1.0))
+        st.caption(f"{used_share:.1f}% of the budget used.")
+
+    st.caption(
+        _budget_source_text(row)
+        + " Budgets are set by Finance in the finance workspace; the preview shows "
+        "what this purchase order leaves."
+    )
+    return row
+
+
+def _render_po_budget_check(check):
+    """Budget section of the PO preview."""
+    st.markdown("**Budget check**")
+    if not check.get("checked"):
+        st.warning(check.get("message") or "The department budget could not be checked.")
+        return
+
+    columns = st.columns(3)
+    po_label = "This purchase order"
+    if check.get("currency") and check["currency"] != "INR":
+        po_label += f" (in INR at {check['exchange_rate']:g})"
+    columns[0].markdown(
+        amount_tile_html("Available now", _money_inr(check["available_before"])),
+        unsafe_allow_html=True,
+    )
+    columns[1].markdown(
+        amount_tile_html(po_label, _money_inr(check["po_amount"])),
+        unsafe_allow_html=True,
+    )
+    columns[2].markdown(
+        amount_tile_html("Left after this PO", _money_inr(check["available_after"])),
+        unsafe_allow_html=True,
+    )
+    if check.get("exceeds"):
+        st.error(
+            f"Over budget by {_money_inr(check['shortfall'])}. "
+            + check["message"]
+        )
+    else:
+        st.success(check["message"])
+
+
 def render_create_po(reference, user=None):
     st.markdown("### Create a purchase order")
     st.info(
@@ -514,86 +850,93 @@ def render_create_po(reference, user=None):
             "for this temporary preview."
         )
 
+    currencies = get_currency_options(reference)
+    department_options = get_department_options(reference)
+
+    _render_po_upload(
+        reference, vendor_options, department_options, currencies, user
+    )
+
+    st.markdown("#### Purchase order form")
+
+    # No explicit value: the default is the minimum (1), and a document
+    # upload can set the count through session state.
     item_count = st.number_input(
         "Number of line items",
         min_value=1,
-        max_value=8,
-        value=1,
+        max_value=MAX_PO_ITEMS,
         step=1,
         key="po_item_count",
     )
 
+    st.markdown("#### 1. Vendor details")
+    if vendor_options:
+        vendor_name = st.selectbox(
+            "Select vendor", vendor_options, key="po_vendor_select"
+        )
+    else:
+        vendor_name = st.text_input("Vendor name", key="po_vendor_text")
+
+    currency = st.selectbox(
+        "Currency", currencies, key="po_currency_select"
+    )
+    tolerance = st.number_input(
+        "Price tolerance (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=1.0,
+        step=0.25,
+    )
+
+    st.divider()
+    st.markdown("#### 2. Department and budget mapping")
+    st.caption(
+        "Select a department from dataset/reference_data.json. The department "
+        "ID is saved on the PO so the budget checker can resolve it, and the "
+        "department's budget is shown below. The budgets are demonstration "
+        "figures, not verified university financial data."
+    )
+    selected_department = None
+    if department_options:
+        department_labels = {
+            _department_label(item): item
+            for item in department_options
+        }
+        selected_label = st.selectbox(
+            "Department",
+            options=list(department_labels),
+            key="po_department",
+        )
+        selected_department = department_labels[selected_label]
+        department = selected_department["name"]
+        department_id = selected_department["department_id"]
+        cost_center = selected_department.get("cost_center")
+        st.caption(f"Department ID: {department_id}")
+        if cost_center:
+            st.caption(f"Cost centre: {cost_center}")
+        else:
+            st.caption("Cost-centre master data is not available; left unassigned.")
+    else:
+        department = None
+        department_id = None
+        cost_center = None
+        st.warning(
+            "No department records with IDs were found in the reference data. "
+            "This PO cannot be created with a verified department mapping."
+        )
+        st.selectbox(
+            "Department",
+            options=["No department records available"],
+            disabled=True,
+            key="po_department_unavailable",
+        )
+
+    # Shows the department's budget. It sits outside the form so it updates
+    # as soon as a different department is picked.
+    _render_department_budget(reference, department_id)
+
+    st.divider()
     with st.form("create_po_preview_form"):
-        st.markdown("#### 1. Vendor details")
-        if vendor_options:
-            vendor_name = st.selectbox("Select vendor", vendor_options)
-        else:
-            vendor_name = st.text_input("Vendor name")
-
-        currencies = sorted({
-            str(po.get("currency") or "INR")
-            for po in reference.get("purchase_orders", [])
-            if isinstance(po, dict)
-        })
-        if not currencies:
-            currencies = ["INR"]
-        if "INR" not in currencies:
-            currencies.insert(0, "INR")
-
-        currency = st.selectbox("Currency", currencies)
-        tolerance = st.number_input(
-            "Price tolerance (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=1.0,
-            step=0.25,
-        )
-
-        st.divider()
-        st.markdown("#### 2. Department and budget mapping")
-        st.caption(
-            "Select a department from dataset/reference_data.json. The department "
-            "ID is saved on the PO so the budget checker can resolve it. The "
-            "department budgets in this dataset are demonstration figures, not "
-            "verified university financial data."
-        )
-        department_options = get_department_options(reference)
-        selected_department = None
-        if department_options:
-            department_labels = {
-                f"{item['name']} ({item['department_id']})": item
-                for item in department_options
-            }
-            selected_label = st.selectbox(
-                "Department",
-                options=list(department_labels),
-                key="po_department",
-            )
-            selected_department = department_labels[selected_label]
-            department = selected_department["name"]
-            department_id = selected_department["department_id"]
-            cost_center = selected_department.get("cost_center")
-            st.caption(f"Department ID: {department_id}")
-            if cost_center:
-                st.caption(f"Cost centre: {cost_center}")
-            else:
-                st.caption("Cost-centre master data is not available; left unassigned.")
-        else:
-            department = None
-            department_id = None
-            cost_center = None
-            st.warning(
-                "No department records with IDs were found in the reference data. "
-                "This PO cannot be created with a verified department mapping."
-            )
-            st.selectbox(
-                "Department",
-                options=["No department records available"],
-                disabled=True,
-                key="po_department_unavailable",
-            )
-
-        st.divider()
         st.markdown("#### 3. Purchase order items")
         st.caption(
             "Enter the agreed unit price from the vendor quotation. Quantity and price "
@@ -674,6 +1017,29 @@ def render_create_po(reference, user=None):
                     for item in normalized_items
                 )
                 po_id = get_next_po_id(reference.get("purchase_orders", []))
+                po_id_source = "assigned"
+                source_document = None
+
+                # If the form was filled from an uploaded PO, keep a link to
+                # that file and, when asked, the PO number printed on it.
+                upload = st.session_state.get("po_upload_result")
+                if upload:
+                    source_document = {
+                        "file_name": upload.get("file_name"),
+                        "sha256": upload.get("sha256"),
+                        "read_by_model": upload.get("model"),
+                    }
+                    printed_po_id = upload.get("printed_po_id")
+                    if (
+                        printed_po_id is not None
+                        and st.session_state.get("po_use_printed_number")
+                        and printed_po_id not in get_used_po_ids(
+                            reference.get("purchase_orders", [])
+                        )
+                    ):
+                        po_id = int(printed_po_id)
+                        po_id_source = "document"
+
                 if not isinstance(selected_department, dict):
                     st.error(
                         "A department ID from the reference data is required. "
@@ -683,6 +1049,8 @@ def render_create_po(reference, user=None):
 
                 st.session_state["po_draft_preview"] = {
                     "po_id": po_id,
+                    "po_id_source": po_id_source,
+                    "source_document": source_document,
                     "po_number": f"PO-{po_id}",
                     "vendor": vendor_name,
                     "vendor_id": get_vendor_id(reference, vendor_name),
@@ -747,6 +1115,13 @@ def render_create_po(reference, user=None):
             + format_amount(draft["total"], draft["currency"])
         )
 
+        # Checked against the current budget each time the preview is shown,
+        # so a change made by Finance in the meantime is picked up.
+        budget_check = po_budget_check(
+            reference, draft.get("department_id"), draft["total"], draft["currency"]
+        )
+        _render_po_budget_check(budget_check)
+
         save_col, clear_col = st.columns(2)
         if save_col.button(
             f"Save purchase order as po_{draft['po_id']}.json",
@@ -758,10 +1133,16 @@ def render_create_po(reference, user=None):
                 # Recheck IDs immediately before writing so a stale preview
                 # cannot replace a PO created by another session.
                 latest_reference = load_procurement_data()
-                latest_next_id = get_next_po_id(
-                    latest_reference.get("purchase_orders", [])
-                )
-                if latest_next_id != int(draft["po_id"]):
+                latest_pos = latest_reference.get("purchase_orders", [])
+                latest_next_id = get_next_po_id(latest_pos)
+                keeps_printed_number = draft.get("po_id_source") == "document"
+
+                if keeps_printed_number and int(draft["po_id"]) in get_used_po_ids(latest_pos):
+                    st.error(
+                        f"{draft['po_number']} now exists. Clear this preview and "
+                        "generate it again to avoid replacing another purchase order."
+                    )
+                elif not keeps_printed_number and latest_next_id != int(draft["po_id"]):
                     st.error(
                         f"The next PO ID is now {latest_next_id}. Clear this preview "
                         "and generate it again to avoid an ID collision."
@@ -789,14 +1170,52 @@ def render_create_po(reference, user=None):
                         "total_amount_basis": "PRE_TAX_SUBTOTAL",
                         "created_by": (user or {}).get("username"),
                     }
+                    # Re-check against the latest budget at the moment of saving
+                    # and keep the result on the PO for approvers and auditors.
+                    saved_check = po_budget_check(
+                        latest_reference,
+                        draft.get("department_id"),
+                        draft["total"],
+                        draft["currency"],
+                    )
+                    po_record["budget_check_at_creation"] = {
+                        "checked": saved_check["checked"],
+                        "exceeds_available_budget": saved_check["exceeds"],
+                        "available_before_inr": saved_check["available_before"],
+                        "po_amount_inr": saved_check["po_amount"],
+                        "available_after_inr": saved_check["available_after"],
+                        "exchange_rate": saved_check["exchange_rate"],
+                        "budget_source": saved_check["budget_source"],
+                        "note": saved_check["message"],
+                    }
+                    if draft.get("source_document"):
+                        # Traceability: which uploaded file this PO came from.
+                        po_record["source_document"] = draft["source_document"]
+                        po_record["entry_method"] = "DOCUMENT_UPLOAD_REVIEWED"
                     saved_path = save_purchase_order(draft["po_id"], po_record)
+                    _audit(
+                        "po:budget_check",
+                        {
+                            "po_number": draft["po_number"],
+                            "department_id": draft.get("department_id"),
+                            "user": (user or {}).get("username"),
+                            "result": po_record["budget_check_at_creation"],
+                        },
+                    )
                     relative_path = saved_path.relative_to(BASE_DIR)
                     st.session_state["po_saved_message"] = (
                         "Purchase order saved successfully: "
                         + str(relative_path)
                         + " · " + draft["po_number"]
                     )
+                    if saved_check.get("exceeds"):
+                        st.session_state["po_saved_message"] += (
+                            ". Note: it is over the department's available budget by "
+                            + _money_inr(saved_check["shortfall"])
+                            + ". Unless Finance raises the budget, invoices against it will go to human review."
+                        )
                     st.session_state.pop("po_draft_preview", None)
+                    st.session_state.pop("po_upload_result", None)
                     st.rerun()
             except (RecordStoreError, TypeError, ValueError) as exc:
                 st.error("The purchase order was not saved. " + str(exc))

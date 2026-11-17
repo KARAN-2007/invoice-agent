@@ -1,4 +1,18 @@
-"""Visual theme for the invoice agent Streamlit app."""
+"""Visual theme for the invoice agent Streamlit app.
+
+Design notes
+- One quiet canvas, white surfaces, hairline borders. No gradients, glass or
+  drifting backgrounds: the invoice evidence is the content, not the chrome.
+- Graphite sidebar with the signed-in person at the top and the workspace list
+  below it. The login panel uses the same graphite so signing in feels like the
+  panel folding into the sidebar.
+- One accent ("ledger teal") for primary actions and the active workspace.
+  Green, amber and red are reserved for check results.
+- One typeface (Instrument Sans). Amounts use tabular figures so columns of
+  numbers line up.
+"""
+
+import html
 
 import streamlit as st
 
@@ -6,105 +20,36 @@ import streamlit as st
 CSS = """
 <style>
 
-@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=DM+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap');
 
 :root {
-  --ink:#12163A;
-  --ink-2:#1D2354;
-  --canvas:#F3F5FB;
+  --graphite:#1F232B;
+  --graphite-2:#2A2F39;
+  --canvas:#F4F5F7;
   --surface:#FFFFFF;
-  --accent:#3340F2;
-  --accent-2:#6A4DF5;
-  --muted:#444C70;
-  --line:#DDE1F0;
-  --ok:#12A36B;
-  --ok-bg:#E6F6EF;
-  --warn:#C98200;
+  --ink:#1A1D24;
+  --muted:#5D6472;
+  --line:#E2E5EA;
+  --accent:#0F6F62;
+  --accent-strong:#0B5A50;
+  --accent-soft:#E3F1EE;
+  --accent-on-dark:#6FD6C0;
+  --ok:#1B7F4B;
+  --warn:#9A6200;
   --warn-bg:#FFF4DC;
-  --bad:#D6455D;
+  --bad:#B8283F;
+  --font:'Instrument Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
 }
 
-/* ---------- BACKGROUND ---------- */
+
+/* ---------- PAGE ---------- */
 
 [data-testid='stAppViewContainer'] {
-  /* Keep Streamlit's native viewport and scroll layout intact. */
-  background:
-    radial-gradient(900px circle at 100% 0%, rgba(56,189,248,.45), transparent 60%),
-    radial-gradient(800px circle at 100% 100%, rgba(168,85,247,.40), transparent 60%),
-    radial-gradient(700px circle at 0% 100%, rgba(51,64,242,.28), transparent 60%),
-    radial-gradient(600px circle at 0% 0%, rgba(18,163,107,.18), transparent 60%),
-    #EEF0FA !important;
-}
-
-[data-testid='stAppViewContainer']::before {
-  content:'';
-  position:fixed;
-  inset:-10%;
-  z-index:0;
-  pointer-events:none;
-  background:
-    radial-gradient(ellipse 45% 40% at 10% 15%, rgba(51,64,242,.28), transparent 70%),
-    radial-gradient(ellipse 40% 35% at 90% 10%, rgba(0,170,220,.26), transparent 70%),
-    radial-gradient(ellipse 45% 40% at 85% 90%, rgba(150,90,255,.28), transparent 70%),
-    radial-gradient(ellipse 40% 35% at 10% 95%, rgba(18,163,107,.14), transparent 70%);
-  animation:drift 24s ease-in-out infinite alternate;
-}
-
-[data-testid='stAppViewContainer']::after {
-  content:'';
-  position:fixed;
-  inset:0;
-  z-index:0;
-  pointer-events:none;
-  background-image:radial-gradient(rgba(51,64,242,.45) 1.6px, transparent 1.6px);
-  background-size:28px 28px;
-  -webkit-mask-image:radial-gradient(ellipse at 75% 50%, #000 15%, transparent 70%);
-  mask-image:radial-gradient(ellipse at 75% 50%, #000 15%, transparent 70%);
-}
-
-[data-testid='stMain']::before {
-  content:'';
-  position:fixed;
-  top:20%;
-  right:4%;
-  width:520px;
-  height:520px;
-  z-index:-1;
-  pointer-events:none;
-  border-radius:50%;
-  background:radial-gradient(circle, rgba(106,77,245,.60), rgba(56,189,248,.25) 55%, transparent 72%);
-  filter:blur(60px);
-  animation:blob 16s ease-in-out infinite alternate;
-}
-
-@keyframes drift {
-  from { transform:translate3d(-2%,-1%,0) scale(1); }
-  to { transform:translate3d(2%,2%,0) scale(1.05); }
-}
-
-@keyframes blob {
-  from { transform:translate(0,0) scale(1); }
-  to { transform:translate(-90px,60px) scale(1.2); }
-}
-
-/* Keep content above decorative background.
-   Let Streamlit manage page and sidebar scrolling naturally. */
-
-[data-testid='stMain'],
-[data-testid='stHeader'] {
-  position:relative;
-  z-index:1;
-}
-
-[data-testid='stSidebar'] {
-  z-index:3;
+  background:var(--canvas) !important;
 }
 
 [data-testid='stMain'],
-[data-testid='stMainBlockContainer'] {
-  background:transparent !important;
-}
-
+[data-testid='stMainBlockContainer'],
 [data-testid='stHeader'] {
   background:transparent !important;
 }
@@ -116,9 +61,9 @@ footer {
 }
 
 .block-container {
-  max-width:1480px;
+  max-width:1280px;
   /* Extra end space lets the final cards/expanders scroll fully into view. */
-  padding:1.2rem 2rem 6rem;
+  padding:1.6rem 2.2rem 6rem;
 }
 
 /* Preserve normal vertical scrolling in Streamlit's main content area. */
@@ -142,45 +87,55 @@ footer {
 .stApp textarea,
 .stApp button,
 [data-testid='stCaptionContainer'] {
-  font-family:'DM Sans',system-ui,sans-serif;
+  font-family:var(--font);
+}
+
+.stApp {
+  color:var(--ink);
 }
 
 h1, h2, h3, h4 {
-  font-family:'Bricolage Grotesque','DM Sans',sans-serif !important;
+  font-family:var(--font) !important;
   color:var(--ink);
-  letter-spacing:-.03em;
+  letter-spacing:-.02em;
 }
 
 h1 {
-  font-weight:800 !important;
+  font-size:2rem !important;
+  font-weight:650 !important;
+  line-height:1.15 !important;
+  padding-top:.2rem !important;
 }
 
-h2, h3 {
+h2 {
+  font-size:1.4rem !important;
+  font-weight:600 !important;
+}
+
+h3 {
+  font-size:1.12rem !important;
   font-weight:600 !important;
 }
 
 [data-testid='stCaptionContainer'],
 [data-testid='stCaptionContainer'] * {
-  color:#3B4366 !important;
+  color:var(--muted) !important;
   opacity:1 !important;
 }
 
 input::placeholder,
 textarea::placeholder {
-  color:#6B7394 !important;
+  color:#8A919E !important;
   opacity:1 !important;
 }
 
+/* Small context line above a page title. */
 .page-eyebrow {
-  display:inline-block;
-  font-size:.82rem;
-  font-weight:600;
-  color:var(--accent);
-  background:rgba(51,64,242,.09);
-  padding:4px 12px;
-  border-radius:999px;
+  font-size:.84rem;
+  font-weight:500;
+  color:var(--muted);
   text-transform:lowercase;
-  margin-bottom:6px;
+  margin-bottom:2px;
 }
 
 .page-eyebrow::first-letter {
@@ -188,50 +143,119 @@ textarea::placeholder {
 }
 
 
-/* ---------- CARDS, METRICS, TABS ---------- */
+/* ---------- SURFACES: CARDS, METRICS, TABS ---------- */
 
 [data-testid='stVerticalBlockBorderWrapper'] {
-  background:rgba(255,255,255,.82) !important;
+  background:var(--surface) !important;
   border:1px solid var(--line) !important;
-  border-radius:16px !important;
-  box-shadow:0 8px 28px rgba(18,22,58,.06);
-  backdrop-filter:blur(14px);
+  border-radius:10px !important;
+  box-shadow:none;
 }
 
 [data-testid='stMetric'] {
   background:var(--surface);
   border:1px solid var(--line);
-  border-left:4px solid var(--accent);
-  border-radius:14px;
+  border-radius:10px;
   padding:16px 18px;
-  box-shadow:0 4px 18px rgba(18,22,58,.05);
+}
+
+[data-testid='stMetricLabel'],
+[data-testid='stMetricLabel'] p {
+  color:var(--muted) !important;
+  font-size:.84rem !important;
+  font-weight:500;
 }
 
 [data-testid='stMetricValue'] {
-  font-family:'Bricolage Grotesque',sans-serif;
-  font-weight:800;
+  font-family:var(--font);
+  font-weight:650;
   color:var(--ink);
+  font-variant-numeric:tabular-nums;
+  letter-spacing:-.02em;
 }
 
+/* Amount tiles (finance workspace). The value shrinks to fit narrow
+   columns; if it still does not fit it is cut with "…" and the full
+   amount shows on hover. */
+.amount-tile {
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:16px 18px;
+  min-width:0;
+  height:100%;
+  box-sizing:border-box;
+  /* Lets the value size itself to this tile's own width. */
+  container-type:inline-size;
+}
+
+.amount-tile .label {
+  color:var(--muted);
+  font-size:.84rem;
+  font-weight:500;
+  margin-bottom:4px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+.amount-tile:hover .value,
+.amount-tile:focus .value,
+.amount-tile:focus-within .value,
+.amount-tile:hover .label,
+.amount-tile:focus .label,
+.amount-tile:focus-within .label {
+  /* Hover or keyboard focus: let a cut-off amount wrap so it shows in full. */
+  white-space:normal;
+  overflow:visible;
+  text-overflow:clip;
+  overflow-wrap:anywhere;
+}
+
+.amount-tile:focus-visible {
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+}
+
+.amount-tile .value {
+  color:var(--ink);
+  font-weight:650;
+  font-size:clamp(1.05rem, 1.7vw, 1.75rem);
+  /* Browsers with container queries fit ~13 characters to the tile width. */
+  font-size:clamp(.95rem, 11cqi, 1.75rem);
+  line-height:1.2;
+  letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  cursor:help;
+}
+
+/* Tabs: plain text with an underline on the active one. */
 [data-baseweb='tab-list'] {
-  gap:6px;
-  background:rgba(18,22,58,.06);
-  padding:5px;
-  border-radius:12px;
-  width:fit-content;
+  gap:4px;
+  background:transparent;
+  padding:0;
+  border-bottom:1px solid var(--line);
 }
 
 button[data-baseweb='tab'] {
-  border-radius:9px;
-  padding:8px 16px;
+  background:transparent;
+  border-radius:0;
+  padding:10px 14px;
   height:auto;
+  color:var(--muted);
+}
+
+button[data-baseweb='tab']:hover {
+  color:var(--ink);
 }
 
 button[data-baseweb='tab'][aria-selected='true'] {
-  background:var(--surface);
-  box-shadow:0 2px 8px rgba(18,22,58,.10);
-  color:var(--accent);
+  color:var(--ink);
   font-weight:600;
+  box-shadow:inset 0 -2px 0 var(--accent);
 }
 
 [data-baseweb='tab-highlight'],
@@ -240,20 +264,24 @@ button[data-baseweb='tab'][aria-selected='true'] {
 }
 
 [data-testid='stAlert'] {
-  border-radius:12px;
+  border-radius:8px;
   border:1px solid var(--line);
 }
 
 [data-testid='stExpander'] {
   border:1px solid var(--line) !important;
-  border-radius:12px;
-  background:rgba(255,255,255,.7);
+  border-radius:10px;
+  background:var(--surface);
 }
 
 [data-testid='stDataFrame'] {
   border:1px solid var(--line);
-  border-radius:12px;
+  border-radius:10px;
   overflow:hidden;
+}
+
+hr {
+  border-color:var(--line) !important;
 }
 
 
@@ -262,37 +290,36 @@ button[data-baseweb='tab'][aria-selected='true'] {
 div[data-baseweb='input'] > div,
 div[data-baseweb='select'] > div,
 div[data-baseweb='textarea'] {
-  background:#fff;
-  border-radius:11px;
+  background:var(--surface);
+  border-radius:8px;
   border:1px solid var(--line);
 }
 
-div[data-baseweb='input']:focus-within > div {
+div[data-baseweb='input']:focus-within > div,
+div[data-baseweb='textarea']:focus-within {
   border-color:var(--accent);
-  box-shadow:0 0 0 3px rgba(51,64,242,.15);
+  box-shadow:0 0 0 3px rgba(15,111,98,.16);
 }
 
 [data-testid='stFileUploaderDropzone'] {
-  background:rgba(51,64,242,.04);
-  border:2px dashed rgba(51,64,242,.35);
-  border-radius:14px;
-  padding:30px;
-  transition:border-color .2s, background .2s;
+  background:var(--surface);
+  border:1.5px dashed #C4C9D2;
+  border-radius:10px;
+  padding:28px;
+  transition:border-color .15s, background .15s;
 }
 
 [data-testid='stFileUploaderDropzone']:hover {
   border-color:var(--accent);
-  background:rgba(51,64,242,.08);
+  background:var(--accent-soft);
 }
 
 div[data-testid='stForm'] {
-  background:rgba(255,255,255,.66);
-  -webkit-backdrop-filter:blur(16px);
-  backdrop-filter:blur(16px);
-  border:1px solid rgba(255,255,255,.85);
-  border-radius:20px;
-  padding:28px;
-  box-shadow:0 20px 60px rgba(51,64,242,.14);
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:26px;
+  box-shadow:none;
 }
 
 
@@ -301,29 +328,30 @@ div[data-testid='stForm'] {
 button[kind='primary'],
 [data-testid='stBaseButton-primary'],
 [data-testid='stBaseButton-primaryFormSubmit'] {
-  background:linear-gradient(135deg,var(--accent),var(--accent-2)) !important;
+  background:var(--accent) !important;
   color:#fff !important;
-  border:none !important;
-  border-radius:11px !important;
+  border:1px solid var(--accent) !important;
+  border-radius:8px !important;
   font-weight:600 !important;
-  min-height:44px;
-  box-shadow:0 6px 18px rgba(51,64,242,.28);
-  transition:transform .15s, box-shadow .15s;
+  min-height:42px;
+  box-shadow:none !important;
+  transition:background .15s;
 }
 
 button[kind='primary']:hover,
 [data-testid='stBaseButton-primary']:hover,
 [data-testid='stBaseButton-primaryFormSubmit']:hover {
-  transform:translateY(-2px);
-  box-shadow:0 12px 28px rgba(51,64,242,.40);
+  background:var(--accent-strong) !important;
+  border-color:var(--accent-strong) !important;
 }
 
 [data-testid='stBaseButton-secondary'] {
-  background:#fff;
+  background:var(--surface);
   border:1px solid var(--line);
-  border-radius:11px;
-  min-height:44px;
+  border-radius:8px;
+  min-height:42px;
   font-weight:600;
+  color:var(--ink);
 }
 
 [data-testid='stBaseButton-secondary']:hover {
@@ -331,51 +359,176 @@ button[kind='primary']:hover,
   color:var(--accent);
 }
 
+.stApp button:focus-visible {
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+}
+
 
 /* ---------- SIDEBAR ---------- */
 
 [data-testid='stSidebar'] {
-  background:var(--ink) !important;
-  border-right:1px solid #232A5E;
+  background:var(--graphite) !important;
+  border-right:none;
 }
 
-[data-testid='stSidebar'] [data-testid='stMarkdownContainer'] * {
-  color:#F4F5FF !important;
+[data-testid='stSidebar'] [data-testid='stMarkdownContainer'],
+[data-testid='stSidebar'] [data-testid='stMarkdownContainer'] p {
+  color:#E8EAEE !important;
 }
 
-[data-testid='stSidebar'] [data-testid='stCaptionContainer'] {
-  color:#9AA3D6 !important;
-}
-
-[data-testid='stSidebar'] [data-testid='stCaptionContainer'] p {
-  color:#9AA3D6 !important;
+[data-testid='stSidebar'] [data-testid='stCaptionContainer'],
+[data-testid='stSidebar'] [data-testid='stCaptionContainer'] * {
+  color:#9BA2AF !important;
 }
 
 [data-testid='stSidebar'] hr {
-  border-color:rgba(255,255,255,.12);
+  border-color:rgba(255,255,255,.10) !important;
+}
+
+.side-brand {
+  font-size:1.02rem;
+  font-weight:650;
+  letter-spacing:-.01em;
+  color:#FFFFFF;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin:2px 0 22px;
+}
+
+/* A small invoice glyph: a sheet with two ruled lines. */
+.side-brand .glyph {
+  flex:none;
+  width:20px;
+  height:24px;
+  border-radius:4px;
+  background:
+    linear-gradient(var(--graphite),var(--graphite)) 5px 8px / 10px 2px no-repeat,
+    linear-gradient(var(--graphite),var(--graphite)) 5px 13px / 7px 2px no-repeat,
+    var(--accent-on-dark);
+}
+
+.side-profile {
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:14px 12px;
+  border-radius:10px;
+  background:var(--graphite-2);
+  margin-bottom:22px;
+}
+
+.side-avatar {
+  flex:none;
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  display:grid;
+  place-items:center;
+  background:var(--accent-on-dark);
+  color:var(--graphite);
+  font-weight:700;
+  font-size:.92rem;
+}
+
+.side-name {
+  color:#FFFFFF;
+  font-weight:600;
+  line-height:1.25;
+  overflow-wrap:anywhere;
+}
+
+.side-role {
+  color:#9BA2AF;
+  font-size:.84rem;
+  line-height:1.3;
+}
+
+.side-heading {
+  color:#9BA2AF;
+  font-size:.8rem;
+  font-weight:500;
+  margin:0 0 6px 12px;
+}
+
+/* Workspace shown as a nav row (single-workspace roles). */
+.side-nav-item {
+  padding:9px 12px;
+  border-radius:8px;
+  border-left:3px solid var(--accent-on-dark);
+  background:rgba(255,255,255,.08);
+  color:#FFFFFF;
+  font-weight:600;
+}
+
+/* Workspace picker (multi-workspace roles): radio rows styled as nav rows. */
+[data-testid='stSidebar'] [data-testid='stRadio'] [role='radiogroup'] {
+  gap:2px;
+}
+
+[data-testid='stSidebar'] [data-testid='stRadio'] label[data-baseweb='radio'] {
+  width:100%;
+  margin:0;
+  padding:9px 12px;
+  border-radius:8px;
+  border-left:3px solid transparent;
+  cursor:pointer;
+}
+
+[data-testid='stSidebar'] [data-testid='stRadio'] label[data-baseweb='radio']:hover {
+  background:rgba(255,255,255,.05);
+}
+
+[data-testid='stSidebar'] [data-testid='stRadio'] label[data-baseweb='radio']:has(input:checked) {
+  background:rgba(255,255,255,.08);
+  border-left-color:var(--accent-on-dark);
+}
+
+[data-testid='stSidebar'] [data-testid='stRadio'] label[data-baseweb='radio'] p {
+  color:#D5D9E0 !important;
+}
+
+[data-testid='stSidebar'] [data-testid='stRadio'] label[data-baseweb='radio']:has(input:checked) p {
+  color:#FFFFFF !important;
+  font-weight:600;
+}
+
+/* Hide the radio dot, but only when that element is not the label text. */
+[data-testid='stSidebar'] [data-testid='stRadio'] label[data-baseweb='radio'] > div:first-child:not(:has([data-testid='stMarkdownContainer'])) {
+  display:none;
 }
 
 [data-testid='stSidebar'] button {
-  background:rgba(255,255,255,.07) !important;
-  color:#fff !important;
+  background:transparent !important;
+  color:#D5D9E0 !important;
   border:1px solid rgba(255,255,255,.16) !important;
-  border-radius:11px;
+  border-radius:8px;
   box-shadow:none !important;
 }
 
 [data-testid='stSidebar'] button:hover {
-  background:rgba(255,255,255,.14) !important;
+  background:rgba(255,255,255,.08) !important;
+  color:#FFFFFF !important;
+}
+
+[data-testid='stSidebar'] button:focus-visible {
+  outline:2px solid var(--accent-on-dark);
+  outline-offset:2px;
 }
 
 
 /* ---------- UPLOAD PAGE HELPERS ---------- */
 
 .upload-step {
-  background:#fff;
+  background:var(--surface);
   border:1px solid var(--line);
-  border-left:4px solid var(--accent);
-  border-radius:12px;
+  border-radius:10px;
   padding:12px 16px;
+}
+
+.upload-step b {
+  color:var(--ink);
 }
 
 .upload-step small {
@@ -385,131 +538,112 @@ button[kind='primary']:hover,
 
 /* ---------- LOGIN ---------- */
 
-.login-label {
-  font-weight:600;
-  color:var(--accent);
-  font-size:.9rem;
-}
-
 [data-testid='stHorizontalBlock']:has(.login-hero) {
   align-items:center;
 }
 
 .login-hero {
-  position:relative;
-  overflow:hidden;
-  border-radius:26px;
+  border-radius:14px;
   padding:40px;
-  min-height:560px;
+  min-height:540px;
   color:#fff;
-  background:
-    radial-gradient(circle at 88% 0%, rgba(106,77,245,.55), transparent 50%),
-    linear-gradient(150deg,var(--ink),var(--ink-2) 70%);
-  box-shadow:0 24px 60px rgba(18,22,58,.28);
+  background:var(--graphite);
+  display:flex;
+  flex-direction:column;
 }
 
-.login-hero .brand {
-  display:flex;
-  align-items:center;
-  gap:10px;
-  font-weight:600;
-  color:#C9CEFF;
-  margin-bottom:34px;
+.login-hero .side-brand {
+  margin-bottom:auto;
+  padding-bottom:36px;
 }
 
 .login-hero h1 {
   color:#fff !important;
-  font-size:2.6rem;
-  line-height:1.06;
-  font-weight:800;
-  letter-spacing:-.035em;
-  margin:0 0 16px;
-  padding:0;
+  font-size:2.25rem !important;
+  line-height:1.12 !important;
+  font-weight:650 !important;
+  letter-spacing:-.03em;
+  margin:0 0 14px;
+  padding:0 !important;
+  max-width:16ch;
 }
 
 .login-hero .description {
-  color:#B9BFE8;
-  max-width:46ch;
+  color:#B4BAC6;
+  max-width:44ch;
   line-height:1.6;
-  margin-bottom:32px;
+  margin-bottom:30px;
 }
 
+/* A sample invoice being checked: the one moving element on the page. */
 .ticket {
   background:#fff;
   color:var(--ink);
-  border-radius:16px;
-  padding:20px 22px;
-  max-width:520px;
-  box-shadow:0 18px 40px rgba(0,0,0,.30);
-  transform:rotate(-1.2deg);
-  animation:float 6s ease-in-out infinite alternate;
-}
-
-@keyframes float {
-  from { transform:translateY(0) rotate(-1.2deg); }
-  to { transform:translateY(-8px) rotate(-.6deg); }
+  border-radius:10px;
+  padding:18px 20px;
+  max-width:480px;
 }
 
 .ticket-head {
   display:flex;
   justify-content:space-between;
   align-items:flex-start;
-  padding-bottom:14px;
-  margin-bottom:8px;
-  border-bottom:1px dashed var(--line);
+  padding-bottom:12px;
+  margin-bottom:6px;
+  border-bottom:1px solid var(--line);
 }
 
 .ticket-vendor {
-  font-weight:700;
+  font-weight:650;
 }
 
 .ticket-ref {
-  font-family:'IBM Plex Mono',monospace;
-  font-size:.8rem;
+  font-size:.82rem;
   color:var(--muted);
   display:flex;
   gap:12px;
+  font-variant-numeric:tabular-nums;
 }
 
 .ticket-total {
-  font-family:'IBM Plex Mono',monospace;
-  font-weight:500;
-  font-size:1.25rem;
+  font-weight:650;
+  font-size:1.2rem;
+  font-variant-numeric:tabular-nums;
 }
 
 .check {
   display:flex;
   align-items:center;
   gap:12px;
-  padding:9px 0;
+  padding:8px 0;
   font-size:.93rem;
   opacity:0;
-  transform:translateY(6px);
-  animation:checkIn .5s ease forwards;
+  transform:translateY(4px);
+  animation:checkIn .4s ease forwards;
 }
 
-.ticket .check:nth-child(2) { animation-delay:.6s; }
-.ticket .check:nth-child(3) { animation-delay:1.2s; }
-.ticket .check:nth-child(4) { animation-delay:1.8s; }
-.ticket .check:nth-child(5) { animation-delay:2.6s; }
+.ticket .check:nth-child(2) { animation-delay:.4s; }
+.ticket .check:nth-child(3) { animation-delay:.9s; }
+.ticket .check:nth-child(4) { animation-delay:1.4s; }
+.ticket .check:nth-child(5) { animation-delay:2.1s; }
 
 .tick {
   flex:none;
-  width:22px;
-  height:22px;
+  width:20px;
+  height:20px;
   border-radius:50%;
   background:var(--ok);
   color:#fff;
   display:grid;
   place-items:center;
-  font-size:.8rem;
+  font-size:.74rem;
   font-weight:700;
 }
 
 .check.hold {
   margin-top:6px;
-  padding:12px 14px;
-  border-radius:10px;
+  padding:10px 12px;
+  border-radius:8px;
   background:var(--warn-bg);
   color:#7A5200;
   font-weight:600;
@@ -527,12 +661,8 @@ button[kind='primary']:hover,
 }
 
 .login-footer {
-  display:flex;
-  align-items:center;
-  gap:8px;
   margin-top:14px;
   font-size:.88rem;
-  font-weight:500;
   color:var(--muted);
 }
 
@@ -542,29 +672,19 @@ button[kind='primary']:hover,
 @media (max-width:900px) {
   .login-hero {
     min-height:0;
-    padding:28px;
+    padding:26px;
   }
 
   .login-hero h1 {
-    font-size:2rem;
+    font-size:1.8rem !important;
   }
 
   .block-container {
     padding:1rem;
   }
-
-  [data-testid='stMain']::before {
-    display:none;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  [data-testid='stAppViewContainer']::before,
-  [data-testid='stMain']::before,
-  .ticket {
-    animation:none;
-  }
-
   .check {
     animation:none;
     opacity:1;
@@ -576,10 +696,16 @@ button[kind='primary']:hover,
 """
 
 
-LOGIN_HERO_HTML = """
+BRAND_HTML = '<div class="side-brand"><span class="glyph"></span>Invoice agent</div>'
+
+
+LOGIN_HERO_HTML = (
+    """
 <div class="login-hero">
-  <div class="brand">🧾 Invoice agent</div>
-  <h1>The AI checks the invoice.<br>A person approves the payment.</h1>
+  """
+    + BRAND_HTML
+    + """
+  <h1>The AI checks the invoice. A person approves the payment.</h1>
   <div class="description">
     Upload an invoice and the agent reads it, checks the arithmetic, finds the
     purchase order and confirms the vendor. Nothing is paid until an approver signs off.
@@ -599,13 +725,63 @@ LOGIN_HERO_HTML = """
   </div>
 </div>
 """
+)
 
 
 LOGIN_FOOTER_HTML = """
 <div class="login-footer">
-  🔒 <span>Human approval required for every payment</span>
+  Every payment needs three human approvals. Sign-in pauses after repeated wrong passwords.
 </div>
 """
+
+
+def role_title(role):
+    """Readable role name: 'department_head' -> 'Department head'."""
+
+    return str(role or "").replace("_", " ").strip().capitalize()
+
+
+def _initials(full_name):
+    parts = [part for part in str(full_name or "").split() if part]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
+
+def sidebar_profile_html(full_name, role):
+    """Brand mark plus the signed-in person, shown at the top of the sidebar."""
+
+    return (
+        BRAND_HTML
+        + '<div class="side-profile">'
+        + '<div class="side-avatar">' + html.escape(_initials(full_name)) + "</div>"
+        + "<div>"
+        + '<div class="side-name">' + html.escape(str(full_name or "")) + "</div>"
+        + '<div class="side-role">' + html.escape(role_title(role)) + "</div>"
+        + "</div></div>"
+        + '<div class="side-heading">Workspace</div>'
+    )
+
+
+def sidebar_nav_item_html(page):
+    """A single, already-selected workspace row."""
+
+    return '<div class="side-nav-item">' + html.escape(str(page)) + "</div>"
+
+
+def amount_tile_html(label, value):
+    """A metric tile whose full value appears on hover (title tooltip)."""
+
+    label = html.escape(str(label))
+    value = html.escape(str(value))
+    return (
+        '<div class="amount-tile" tabindex="0" title="' + label + ": " + value + '">'
+        + '<div class="label">' + label + "</div>"
+        + '<div class="value" aria-label="' + label + ": " + value + '">' + value + "</div>"
+        + "</div>"
+    )
 
 
 def inject_theme():

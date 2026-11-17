@@ -18,10 +18,21 @@ DEMO_USERS = [
         "procurement_officer",
         "procurement123",
     ),
-    
+    (
+        "depthead1",
+        "Demo Department Head",
+        "department_head",
+        "depthead123",
+    ),
+    (
+        "finance1",
+        "Demo Finance Officer",
+        "finance_officer",
+        "finance123",
+    ),
     (
         "approver1",
-        "Demo Approver",
+        "Demo Final Approver",
         "approver",
         "approver123",
     ),
@@ -51,7 +62,7 @@ def main():
             + username
         )
 
-    print("\nAll four demo accounts are ready.")
+    print("\nAll " + str(len(DEMO_USERS)) + " demo accounts are ready.")
 
 
 if __name__ == "__main__":
